@@ -1,0 +1,234 @@
+"""
+Sheet Trace Dashboard
+======================
+A Streamlit app: upload your workpaper adjustment flow Excel file,
+pick the sheet, map columns if needed, and get an interactive trace
+diagram plus a downloadable PNG.
+
+Run with:
+    streamlit run app.py
+"""
+
+import io
+import textwrap
+
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+STAGE_COLORS = {
+    "input": "#4C72B0",
+    "calculated": "#DD8452",
+    "output": "#55A868",
+}
+
+IO_STYLES = {
+    "input": dict(linestyle="-", color="#4C72B0"),
+    "output": dict(linestyle="-", color="#55A868"),
+    "calculated": dict(linestyle="--", color="#DD8452"),
+    "upload": dict(linestyle="-.", color="#8172B2"),
+    "download": dict(linestyle="-.", color="#937860"),
+    "run": dict(linestyle=":", color="#C44E52"),
+}
+
+COLUMN_ALIASES = {
+    "stage": "stage",
+    "step no": "step", "step no.": "step", "step": "step",
+    "report/schedule": "report", "report": "report", "schedule": "report",
+    "system/location": "system", "system": "system", "location": "system",
+    "action": "action",
+    "i/o": "io", "io": "io",
+    "standard": "standard",
+}
+
+REQUIRED = ["stage", "step", "report", "system", "action", "io"]
+
+
+def wrap(text, width=22):
+    if pd.isna(text):
+        return ""
+    return "\n".join(textwrap.wrap(str(text), width=width))
+
+
+def guess_column(df_cols, canon_target):
+    """Return the first original column name whose normalized form matches canon_target."""
+    for c in df_cols:
+        key = str(c).strip().lower()
+        if COLUMN_ALIASES.get(key) == canon_target:
+            return c
+    return None
+
+
+def build_trace(df: pd.DataFrame, title: str):
+    df = df.sort_values("step").reset_index(drop=True)
+
+    systems = list(dict.fromkeys(df["system"].fillna("Unspecified")))
+    lane_y = {sys_name: i for i, sys_name in enumerate(reversed(systems))}
+
+    steps_sorted = sorted(df["step"].unique())
+    n_steps = len(steps_sorted)
+    fig_w = max(10, n_steps * 2.0)
+    fig_h = max(4, len(systems) * 1.4 + 1.5)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    for sys_name, y in lane_y.items():
+        ax.axhspan(y - 0.4, y + 0.4, color="#f2f2f2" if y % 2 == 0 else "#ffffff", zorder=0)
+        ax.text(-0.6, y, wrap(sys_name, 18), ha="right", va="center",
+                 fontsize=9, fontweight="bold", color="#333333")
+
+    node_positions = {}
+    box_w, box_h = 1.3, 0.6
+    x_scale = 1.8
+
+    for _, row in df.iterrows():
+        step = row["step"]
+        sys_name = row["system"] if not pd.isna(row["system"]) else "Unspecified"
+        y = lane_y[sys_name]
+        x = step * x_scale
+
+        stage_key = str(row["stage"]).strip().lower() if not pd.isna(row["stage"]) else ""
+        color = STAGE_COLORS.get(stage_key, "#999999")
+
+        box = FancyBboxPatch(
+            (x - box_w / 2, y - box_h / 2), box_w, box_h,
+            boxstyle="round,pad=0.05,rounding_size=0.08",
+            linewidth=1.2, edgecolor=color, facecolor=color, alpha=0.18, zorder=3,
+        )
+        ax.add_patch(box)
+
+        label = f"Step {step}\n{wrap(row['report'], 20)}\n{wrap(row['action'], 24)}"
+        ax.text(x, y, label, ha="center", va="center", fontsize=7.5, zorder=4)
+
+        if "standard" in df.columns and str(row.get("standard", "")).strip() not in ("", "nan", "N", "No"):
+            ax.text(x + box_w / 2 - 0.05, y + box_h / 2 - 0.05, "★",
+                     fontsize=9, color="#B8860B", ha="right", va="top", zorder=5)
+
+        node_positions[step] = (x, y)
+
+    for i in range(len(steps_sorted) - 1):
+        s1, s2 = steps_sorted[i], steps_sorted[i + 1]
+        x1, y1 = node_positions[s1]
+        x2, y2 = node_positions[s2]
+
+        io_row = df[df["step"] == s2].iloc[0]
+        io_key = str(io_row["io"]).strip().lower() if not pd.isna(io_row["io"]) else ""
+        style = IO_STYLES.get(io_key, dict(linestyle="-", color="#666666"))
+
+        arrow = FancyArrowPatch(
+            (x1 + box_w / 2, y1), (x2 - box_w / 2, y2),
+            connectionstyle=f"arc3,rad={0.15 if y1 != y2 else 0}",
+            arrowstyle="-|>", mutation_scale=14,
+            linewidth=1.4, zorder=2, **style,
+        )
+        ax.add_patch(arrow)
+
+    stage_handles = [mpatches.Patch(facecolor=c, edgecolor=c, alpha=0.3, label=s.title())
+                      for s, c in STAGE_COLORS.items()]
+    io_handles = [mlines.Line2D([], [], color=v["color"], linestyle=v["linestyle"], label=k.title())
+                   for k, v in IO_STYLES.items()]
+
+    leg1 = ax.legend(handles=stage_handles, title="Stage", loc="upper left",
+                       bbox_to_anchor=(1.01, 1.0), fontsize=8, title_fontsize=9)
+    ax.add_artist(leg1)
+    ax.legend(handles=io_handles, title="I/O type", loc="upper left",
+               bbox_to_anchor=(1.01, 0.55), fontsize=8, title_fontsize=9)
+
+    ax.set_xlim(min(steps_sorted) * x_scale - 1.5, max(steps_sorted) * x_scale + 1.5)
+    ax.set_ylim(-1, len(systems))
+    ax.set_yticks([])
+    ax.set_xticks([s * x_scale for s in steps_sorted])
+    ax.set_xticklabels([str(s) for s in steps_sorted])
+    ax.set_xlabel("Step No.", fontsize=10)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=15)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Sheet Trace Dashboard", layout="wide")
+st.title("📊 Workpaper Sheet Trace Dashboard")
+st.caption("Upload your adjustment flow Excel file to generate a swimlane trace diagram.")
+
+uploaded = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
+
+if uploaded is not None:
+    xls = pd.ExcelFile(uploaded)
+    sheet = st.selectbox("Select sheet", xls.sheet_names)
+    raw_df = pd.read_excel(xls, sheet_name=sheet)
+
+    st.subheader("Preview")
+    st.dataframe(raw_df.head(10), use_container_width=True)
+
+    st.subheader("Column mapping")
+    st.caption("Auto-matched where possible — adjust any that are wrong before generating.")
+
+    cols = list(raw_df.columns)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        stage_col = st.selectbox("Stage", cols, index=cols.index(guess_column(cols, "stage")) if guess_column(cols, "stage") else 0)
+        step_col = st.selectbox("Step No.", cols, index=cols.index(guess_column(cols, "step")) if guess_column(cols, "step") else 0)
+    with col2:
+        report_col = st.selectbox("Report/Schedule", cols, index=cols.index(guess_column(cols, "report")) if guess_column(cols, "report") else 0)
+        system_col = st.selectbox("System/Location", cols, index=cols.index(guess_column(cols, "system")) if guess_column(cols, "system") else 0)
+    with col3:
+        action_col = st.selectbox("Action", cols, index=cols.index(guess_column(cols, "action")) if guess_column(cols, "action") else 0)
+        io_col = st.selectbox("I/O", cols, index=cols.index(guess_column(cols, "io")) if guess_column(cols, "io") else 0)
+
+    standard_guess = guess_column(cols, "standard")
+    standard_col = st.selectbox("Standard (optional)", ["(none)"] + cols,
+                                  index=(cols.index(standard_guess) + 1) if standard_guess else 0)
+
+    title = st.text_input("Chart title", value="Workpaper Adjustment Flow — Sheet Trace")
+
+    if st.button("Generate trace diagram", type="primary"):
+        df = pd.DataFrame({
+            "stage": raw_df[stage_col],
+            "step": raw_df[step_col],
+            "report": raw_df[report_col],
+            "system": raw_df[system_col],
+            "action": raw_df[action_col],
+            "io": raw_df[io_col],
+        })
+        if standard_col != "(none)":
+            df["standard"] = raw_df[standard_col]
+
+        # Drop rows with no step number, coerce to numeric ordering
+        df = df.dropna(subset=["step"])
+        try:
+            df["step"] = pd.to_numeric(df["step"])
+        except Exception:
+            st.warning("Step No. column isn't purely numeric — sorting as text instead.")
+
+        with st.spinner("Building diagram..."):
+            fig = build_trace(df, title=title)
+
+        st.pyplot(fig, use_container_width=True)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+        st.download_button("Download PNG", data=buf.getvalue(),
+                            file_name="sheet_trace.png", mime="image/png")
+else:
+    st.info("Upload an Excel file above to get started.")
+    with st.expander("Expected columns"):
+        st.markdown(
+            "- **Stage** — Input / Calculated / Output\n"
+            "- **Step No.** — sequence number\n"
+            "- **Report/Schedule** — report or schedule name\n"
+            "- **System/Location** — file/system name (SAP FICO, Longview, Corptax, Excel, etc.)\n"
+            "- **Action** — short description of the step\n"
+            "- **I/O** — Input / Output / Calculated / Upload / Download / Run\n"
+            "- **Standard** — optional Y/N flag, shown as a ★ tag\n\n"
+            "Column names don't need to match exactly — you can remap them after upload."
+        )
