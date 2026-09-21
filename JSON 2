@@ -1,0 +1,51 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": { "name": "dataset" },
+  "width": 700,
+  "height": 300,
+  "layer": [
+    {
+      "description": "Connecting line through steps in order",
+      "mark": { "type": "line", "strokeWidth": 2, "color": "#999999", "opacity": 0.6, "point": false },
+      "encoding": {
+        "x": { "field": "Step No.", "type": "quantitative", "title": "Step No." },
+        "y": { "field": "System", "type": "nominal", "title": "System / Location" },
+        "order": { "field": "Step No." }
+      }
+    },
+    {
+      "description": "Step boxes, colored by Stage",
+      "mark": { "type": "square", "size": 900, "opacity": 0.35, "stroke": true, "strokeWidth": 2 },
+      "encoding": {
+        "x": { "field": "Step No.", "type": "quantitative" },
+        "y": { "field": "System", "type": "nominal" },
+        "color": {
+          "field": "Stage",
+          "type": "nominal",
+          "scale": {
+            "domain": ["Input", "Calculated", "Output", "Other"],
+            "range": ["#4C72B0", "#DD8452", "#55A868", "#999999"]
+          },
+          "legend": { "title": "Stage" }
+        },
+        "tooltip": [
+          { "field": "Step No.", "title": "Step" },
+          { "field": "Report", "title": "Report/Schedule" },
+          { "field": "System", "title": "System" },
+          { "field": "Action", "title": "Action" },
+          { "field": "IO", "title": "I/O" },
+          { "field": "Standard", "title": "Standard" }
+        ]
+      }
+    },
+    {
+      "description": "Step number labels",
+      "mark": { "type": "text", "fontSize": 9, "fontWeight": "bold" },
+      "encoding": {
+        "x": { "field": "Step No.", "type": "quantitative" },
+        "y": { "field": "System", "type": "nominal" },
+        "text": { "field": "Step No.", "type": "quantitative" }
+      }
+    }
+  ]
+}
