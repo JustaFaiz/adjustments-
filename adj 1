@@ -1,0 +1,134 @@
+"""
+adjustment_flow.py
+-------------------
+Design sketch: trace a single flagged adjustment (a "flow break" --
+two cells sharing a value with no formula tying them together) forward
+through the workbook, cell by cell, instead of sheet by sheet. Also
+covers attaching provenance for values that entered Excel from outside
+it (SAP FICO / Longview / Corptax), since that can't be auto-detected
+from formulas -- it has to be supplied.
+
+This intentionally leaves out everything from dashboard.py that isn't
+needed for adjustment tracing: description-tier fuzzy matching, node
+classification (Input/Process/Output), the bridge/visual export. Those
+still work fine on their own; this is just the missing cell-level layer.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class CellRef:
+    sheet: str
+    cell: str  # e.g. "B30"
+
+    def __str__(self):
+        return f"{self.sheet}!{self.cell}"
+
+
+@dataclass
+class CellEdge:
+    source: CellRef                      # the cell being referenced
+    target: CellRef                      # the cell whose formula references it
+    kind: str                            # "formula" | "named_range" | "adjustment"
+    formula_text: Optional[str] = None   # raw formula on target, for formula/named_range edges
+    adjustment_id: Optional[str] = None  # set for the synthetic edge representing a flow break itself
+
+
+@dataclass
+class Adjustment:
+    """One flagged flow break -- a copy-pasted/re-typed value with no
+    formula link. This is exactly what apply_flow_break_detection already
+    finds in dashboard.py; this just gives it a stable identity and a
+    home cell to trace forward from."""
+    id: str                    # e.g. f"{source}__{target}__{value}"
+    source: CellRef            # where the value originally lives
+    target: CellRef            # where the copy/re-type landed
+    value: str
+    match_score: float
+    note: Optional[str] = None
+
+
+@dataclass
+class ExternalSource:
+    system: str                          # "SAP FICO" | "Longview" | "Corptax" | ...
+    reference: str                       # report name, extract id, or file name
+    extracted_at: Optional[str] = None   # ISO date, if known
+    note: Optional[str] = None
+
+
+@dataclass
+class ExternalEdge:
+    source: ExternalSource
+    target: CellRef                      # the workbook cell this value landed in
+    kind: str = "extracted_from"
+
+
+def build_cell_graph(formulas: dict, sheet_lookup: dict = None) -> dict:
+    """
+    Like dashboard.py's extract_cross_sheet_refs, but keeps the actual
+    referenced CELL, not just the sheet name. Reuses the existing
+    CELL_REF_RE from dashboard.py (import it, don't redefine it).
+
+    Returns {CellRef(source): [CellEdge, ...]} -- forward direction,
+    i.e. keyed by the cell being READ, pointing at every cell whose
+    formula reads it.
+    """
+    from dashboard import CELL_REF_RE, _resolve_sheet_name  # reuse as-is
+
+    graph = {}
+    for (sheet, coord), formula in formulas.items():
+        target = CellRef(sheet, coord)
+        for m in CELL_REF_RE.finditer(formula):
+            ref_sheet = m.group(1) or m.group(2) or sheet
+            ref_sheet = _resolve_sheet_name(ref_sheet, sheet_lookup)
+            ref_cell = (m.group(3) or "").replace("$", "")
+            if not ref_cell:
+                continue
+            source = CellRef(ref_sheet, ref_cell)
+            graph.setdefault(source, []).append(
+                CellEdge(source=source, target=target, kind="formula", formula_text=formula)
+            )
+    return graph
+
+
+def trace_adjustment_forward(
+    adjustment: Adjustment,
+    cell_graph: dict,
+    external_edges: list = None,
+) -> list:
+    """
+    BFS forward from the adjustment's TARGET cell (where the value
+    landed) through real formula edges only -- an adjustment's own
+    source/target pair is the starting point, not part of the walk.
+    Returns the ordered list of CellEdge objects actually touched.
+
+    external_edges (optional): if you're also tracking where values
+    came from before Excel, pass ExternalEdge records here so a report
+    can note "this adjustment's source cell was itself an extract from
+    Corptax report X" -- purely informational, doesn't affect the walk.
+    """
+    visited_edges = []
+    seen = {adjustment.target}
+    frontier = [adjustment.target]
+
+    while frontier:
+        next_frontier = []
+        for cell in frontier:
+            for edge in cell_graph.get(cell, []):
+                visited_edges.append(edge)
+                if edge.target not in seen:
+                    seen.add(edge.target)
+                    next_frontier.append(edge.target)
+        frontier = next_frontier
+
+    return visited_edges
+
+
+def external_provenance_for(cell: CellRef, external_edges: list) -> Optional[ExternalEdge]:
+    """Look up whether a given cell has a recorded external source."""
+    for edge in external_edges:
+        if edge.target == cell:
+            return edge
+    return None
