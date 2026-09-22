@@ -1,0 +1,5 @@
+Details = 
+"Step " & 'YourTable'[Step No.] & ": " & 'YourTable'[Report/Schedule] & UNICHAR(10) &
+'YourTable'[Action] & UNICHAR(10) &
+"I/O: " & 'YourTable'[I/O] & "  |  Stage: " & 'YourTable'[Stage] &
+IF('YourTable'[Standard] = "Y", UNICHAR(10) & "★ Standard", "")
