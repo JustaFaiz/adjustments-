@@ -1,0 +1,146 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {
+    "name": "dataset"
+  },
+  "width": 700,
+  "height": 380,
+  "layer": [
+    {
+      "description": "Connecting line through steps in chronological order",
+      "mark": {
+        "type": "line",
+        "strokeWidth": 2,
+        "color": "#999999",
+        "opacity": 0.6,
+        "point": false
+      },
+      "encoding": {
+        "x": {
+          "field": "Stage",
+          "type": "nominal",
+          "title": "Stage",
+          "sort": [
+            "Input",
+            "Calculated",
+            "Output"
+          ]
+        },
+        "y": {
+          "field": "StepNo",
+          "type": "quantitative",
+          "title": "Step No.",
+          "scale": {
+            "reverse": true
+          }
+        },
+        "order": {
+          "field": "StepNo"
+        }
+      }
+    },
+    {
+      "description": "Step boxes, colored by Stage",
+      "mark": {
+        "type": "square",
+        "size": 700,
+        "opacity": 0.35,
+        "stroke": true,
+        "strokeWidth": 2
+      },
+      "encoding": {
+        "x": {
+          "field": "Stage",
+          "type": "nominal",
+          "sort": [
+            "Input",
+            "Calculated",
+            "Output"
+          ]
+        },
+        "y": {
+          "field": "StepNo",
+          "type": "quantitative",
+          "scale": {
+            "reverse": true
+          }
+        },
+        "color": {
+          "field": "Stage",
+          "type": "nominal",
+          "scale": {
+            "domain": [
+              "Input",
+              "Calculated",
+              "Output"
+            ],
+            "range": [
+              "#4C72B0",
+              "#DD8452",
+              "#55A868"
+            ]
+          },
+          "legend": {
+            "title": "Stage"
+          }
+        },
+        "tooltip": [
+          {
+            "field": "StepNo",
+            "title": "Step"
+          },
+          {
+            "field": "Report",
+            "title": "Report/Schedule"
+          },
+          {
+            "field": "System",
+            "title": "System"
+          },
+          {
+            "field": "Action",
+            "title": "Action"
+          },
+          {
+            "field": "IO",
+            "title": "I/O"
+          },
+          {
+            "field": "Standard",
+            "title": "Standard"
+          }
+        ]
+      }
+    },
+    {
+      "description": "Step number labels",
+      "mark": {
+        "type": "text",
+        "fontSize": 9,
+        "fontWeight": "bold"
+      },
+      "encoding": {
+        "x": {
+          "field": "Stage",
+          "type": "nominal",
+          "sort": [
+            "Input",
+            "Calculated",
+            "Output"
+          ]
+        },
+        "y": {
+          "field": "StepNo",
+          "type": "quantitative",
+          "scale": {
+            "reverse": true
+          }
+        },
+        "text": {
+          "field": "StepNo",
+          "type": "quantitative"
+        }
+      }
+    }
+  ]
+}
