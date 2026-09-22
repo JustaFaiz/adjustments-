@@ -1,0 +1,138 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {
+    "name": "dataset"
+  },
+  "width": "container",
+  "height": 260,
+  "transform": [
+    {
+      "calculate": "datum.StepNo * 2.6",
+      "as": "x"
+    }
+  ],
+  "layer": [
+    {
+      "description": "connecting line",
+      "mark": {
+        "type": "line",
+        "strokeWidth": 2,
+        "color": "#999999",
+        "opacity": 0.6
+      },
+      "encoding": {
+        "x": {
+          "field": "x",
+          "type": "quantitative",
+          "axis": null
+        },
+        "y": {
+          "value": 130
+        },
+        "order": {
+          "field": "StepNo"
+        }
+      }
+    },
+    {
+      "description": "background block",
+      "mark": {
+        "type": "rect",
+        "width": 220,
+        "height": 110,
+        "opacity": 0.25,
+        "stroke": true,
+        "strokeWidth": 1.5,
+        "cornerRadius": 6
+      },
+      "encoding": {
+        "x": {
+          "field": "x",
+          "type": "quantitative",
+          "axis": null
+        },
+        "y": {
+          "value": 130
+        },
+        "color": {
+          "field": "Stage",
+          "type": "nominal",
+          "scale": {
+            "domain": [
+              "Input",
+              "Calculated",
+              "Output"
+            ],
+            "range": [
+              "#4C72B0",
+              "#DD8452",
+              "#55A868"
+            ]
+          },
+          "legend": {
+            "title": "Stage"
+          }
+        },
+        "tooltip": [
+          {
+            "field": "StepNo",
+            "title": "Step"
+          },
+          {
+            "field": "System",
+            "title": "System"
+          },
+          {
+            "field": "Stage",
+            "title": "Stage"
+          }
+        ]
+      }
+    },
+    {
+      "description": "system name (bold header)",
+      "mark": {
+        "type": "text",
+        "fontSize": 11,
+        "fontWeight": "bold",
+        "dy": -35
+      },
+      "encoding": {
+        "x": {
+          "field": "x",
+          "type": "quantitative",
+          "axis": null
+        },
+        "y": {
+          "value": 130
+        },
+        "text": {
+          "field": "System"
+        }
+      }
+    },
+    {
+      "description": "row details, pre-combined with line breaks",
+      "mark": {
+        "type": "text",
+        "fontSize": 8.5,
+        "lineBreak": "\n",
+        "dy": -5,
+        "lineHeight": 12
+      },
+      "encoding": {
+        "x": {
+          "field": "x",
+          "type": "quantitative",
+          "axis": null
+        },
+        "y": {
+          "value": 130
+        },
+        "text": {
+          "field": "Details"
+        }
+      }
+    }
+  ]
+}
