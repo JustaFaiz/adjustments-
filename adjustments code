@@ -1,0 +1,258 @@
+"""
+adjustment_app.py
+------------------
+Standalone app: find "adjustments" (a value that exists in two sheets
+with NO formula tying those sheets together anywhere in the workbook)
+and trace exactly which cells downstream consume that value.
+
+Fully independent of dashboard.py / bridge.py -- no shared imports, no
+assumption that app is present or running. Only needs openpyxl, pandas,
+streamlit.
+
+Run with:
+    streamlit run adjustment_app.py
+"""
+
+import io
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CellRef:
+    sheet: str
+    cell: str
+    def __str__(self):
+        return f"{self.sheet}!{self.cell}"
+
+
+@dataclass
+class CellEdge:
+    source: CellRef
+    target: CellRef
+    formula_text: str
+
+
+@dataclass
+class Adjustment:
+    id: str
+    source: CellRef
+    target: CellRef
+    value: str
+
+
+@dataclass
+class ExternalSource:
+    system: str
+    reference: str
+    note: Optional[str] = None
+
+
+# ---------------------------------------------------------------------
+# Workbook loading
+# ---------------------------------------------------------------------
+
+CELL_REF_RE = re.compile(
+    r"(?:(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!)?"
+    r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?!\()"
+)
+
+
+def load_formulas(file_bytes):
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
+    formulas = {}
+    for ws in wb.worksheets:
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            for c_idx, value in enumerate(row, start=1):
+                if isinstance(value, str) and value.startswith("="):
+                    coord = f"{get_column_letter(c_idx)}{r_idx}"
+                    formulas[(ws.title, coord)] = value
+    sheetnames = wb.sheetnames
+    wb.close()
+    return formulas, sheetnames
+
+
+def load_raw_sheets(file_bytes):
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    raw = {}
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raw[ws.title] = pd.DataFrame()
+            continue
+        header, *body = rows
+        header = [h if h is not None else f"Unnamed: {i}" for i, h in enumerate(header)]
+        raw[ws.title] = pd.DataFrame(body, columns=header)
+    wb.close()
+    return raw
+
+
+# ---------------------------------------------------------------------
+# Cell-level graph + the set of sheet-pairs that DO have a formula link
+# ---------------------------------------------------------------------
+
+def build_cell_graph_and_pairs(formulas, sheetnames):
+    lookup = {s.lower(): s for s in sheetnames}
+    graph = {}
+    formula_pairs = set()
+
+    for (sheet, coord), formula in formulas.items():
+        target = CellRef(sheet, coord)
+        for m in CELL_REF_RE.finditer(formula):
+            ref_sheet = m.group(1) or m.group(2)
+            if not ref_sheet:
+                continue
+            ref_sheet = lookup.get(ref_sheet.lower(), ref_sheet)
+            if ref_sheet.lower() == sheet.lower():
+                continue
+            ref_cell = (m.group(3) or "").replace("$", "")
+            if not ref_cell:
+                continue
+            source = CellRef(ref_sheet, ref_cell)
+            graph.setdefault(source, []).append(CellEdge(source, target, formula))
+            formula_pairs.add(frozenset({sheet, ref_sheet}))
+
+    return graph, formula_pairs
+
+
+# ---------------------------------------------------------------------
+# Adjustment detection: same numeric-looking value in two sheets, no
+# formula tying those two sheets together anywhere in the workbook.
+# Deliberately restricted to numeric-looking values -- matching on raw
+# text too would flag common labels ("Total", "Yes") as false positives.
+# ---------------------------------------------------------------------
+
+def find_adjustments(raw_sheets, formula_pairs, max_rows=300, max_cols=15):
+    value_locations = {}  # value string -> [(sheet, cell), ...]
+
+    for sheet, df in raw_sheets.items():
+        cols = list(df.columns)[:max_cols]
+        for col_pos, col in enumerate(cols):
+            series = df[col].dropna().astype(str).str.strip().head(max_rows)
+            for row_pos, v in series.items():
+                if not v or not v.replace(".", "", 1).replace("-", "", 1).isdigit():
+                    continue  # keep numeric-looking values only
+                cell = f"{get_column_letter(col_pos + 1)}{row_pos + 2}"
+                value_locations.setdefault(v, []).append((sheet, cell))
+
+    adjustments = []
+    seen_pairs = set()
+    for value, locations in value_locations.items():
+        if len(locations) < 2:
+            continue
+        for i in range(len(locations)):
+            for j in range(i + 1, len(locations)):
+                (sheet_a, cell_a), (sheet_b, cell_b) = locations[i], locations[j]
+                if sheet_a == sheet_b:
+                    continue
+                if frozenset({sheet_a, sheet_b}) in formula_pairs:
+                    continue  # a real formula already ties these sheets -- not an adjustment
+                dedup_key = (sheet_a, cell_a, sheet_b, cell_b, value)
+                if dedup_key in seen_pairs:
+                    continue
+                seen_pairs.add(dedup_key)
+                adjustments.append(Adjustment(
+                    id=f"{sheet_a}!{cell_a}__{sheet_b}!{cell_b}__{value}",
+                    source=CellRef(sheet_a, cell_a),
+                    target=CellRef(sheet_b, cell_b),
+                    value=value,
+                ))
+    return adjustments
+
+
+# ---------------------------------------------------------------------
+# Forward trace from an adjustment's landing cell
+# ---------------------------------------------------------------------
+
+def trace_forward(start: CellRef, cell_graph):
+    visited_edges = []
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        next_frontier = []
+        for cell in frontier:
+            for edge in cell_graph.get(cell, []):
+                visited_edges.append(edge)
+                if edge.target not in seen:
+                    seen.add(edge.target)
+                    next_frontier.append(edge.target)
+        frontier = next_frontier
+    return visited_edges
+
+
+# ---------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------
+
+st.set_page_config(page_title="Adjustment Flow", layout="wide")
+st.title("Adjustment Flow Tracker")
+st.caption("Pick a flagged adjustment (a value with no formula tying its two sheets together) and trace exactly which cells downstream consume it.")
+
+if "ext_sources" not in st.session_state:
+    st.session_state["ext_sources"] = {}  # str(CellRef) -> ExternalSource
+
+uploaded = st.file_uploader("Upload workbook", type=["xlsx", "xls"])
+if uploaded is None:
+    st.info("Upload a workbook to get started.")
+    st.stop()
+
+file_bytes = uploaded.getvalue()
+
+with st.spinner("Reading formulas..."):
+    formulas, sheetnames = load_formulas(file_bytes)
+with st.spinner("Reading values..."):
+    raw_sheets = load_raw_sheets(file_bytes)
+
+cell_graph, formula_pairs = build_cell_graph_and_pairs(formulas, sheetnames)
+
+with st.spinner("Finding adjustments..."):
+    adjustments = find_adjustments(raw_sheets, formula_pairs)
+
+st.success(f"{len(sheetnames)} sheets, {len(formulas)} formulas, {len(adjustments)} adjustment(s) found.")
+
+if not adjustments:
+    st.info("No adjustments detected -- every shared numeric value between sheets already has a formula tying those sheets together.")
+    st.stop()
+
+options = {f"{a.source} -> {a.target}   (value {a.value})": a for a in adjustments}
+choice = st.selectbox("Select an adjustment", list(options.keys()))
+adjustment = options[choice]
+
+st.subheader("External source (optional)")
+st.caption("Note where this value came from before it entered Excel, if known -- not auto-detected.")
+c1, c2, c3 = st.columns(3)
+with c1:
+    system = st.text_input("System", placeholder="SAP FICO / Longview / Corptax")
+with c2:
+    reference = st.text_input("Reference", placeholder="report name / extract id")
+with c3:
+    note = st.text_input("Note", placeholder="optional")
+
+if st.button("Save external source for this adjustment's source cell"):
+    st.session_state["ext_sources"][str(adjustment.source)] = ExternalSource(system, reference, note)
+    st.success(f"Saved provenance for {adjustment.source}.")
+
+existing = st.session_state["ext_sources"].get(str(adjustment.source))
+if existing:
+    tail = f" ({existing.note})" if existing.note else ""
+    st.caption(f"Recorded source: {existing.system} -- {existing.reference}{tail}")
+
+st.subheader("Downstream flow from this adjustment")
+edges = trace_forward(adjustment.target, cell_graph)
+
+if not edges:
+    st.warning("This adjustment's landing cell isn't referenced by any formula -- it doesn't flow anywhere further in this workbook.")
+else:
+    rows = [{"From": str(e.source), "To": str(e.target), "Formula": e.formula_text} for e in edges]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    touched_sheets = sorted({e.target.sheet for e in edges} | {adjustment.target.sheet})
+    st.caption(f"Reaches {len(touched_sheets)} sheet(s): {', '.join(touched_sheets)}")
