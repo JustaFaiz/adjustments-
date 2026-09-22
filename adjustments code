@@ -81,6 +81,19 @@ def load_formulas(file_bytes):
     return formulas, sheetnames
 
 
+def _dedupe_headers(header):
+    seen = {}
+    deduped = []
+    for h in header:
+        if h in seen:
+            seen[h] += 1
+            deduped.append(f"{h}.{seen[h]}")
+        else:
+            seen[h] = 0
+            deduped.append(h)
+    return deduped
+
+
 def load_raw_sheets(file_bytes):
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     raw = {}
@@ -91,6 +104,7 @@ def load_raw_sheets(file_bytes):
             continue
         header, *body = rows
         header = [h if h is not None else f"Unnamed: {i}" for i, h in enumerate(header)]
+        header = _dedupe_headers(header)
         raw[ws.title] = pd.DataFrame(body, columns=header)
     wb.close()
     return raw
@@ -137,7 +151,10 @@ def find_adjustments(raw_sheets, formula_pairs, max_rows=300, max_cols=15):
     for sheet, df in raw_sheets.items():
         cols = list(df.columns)[:max_cols]
         for col_pos, col in enumerate(cols):
-            series = df[col].dropna().astype(str).str.strip().head(max_rows)
+            column = df[col]
+            if isinstance(column, pd.DataFrame):  # shouldn't happen post-dedup, but don't crash if it does
+                continue
+            series = column.dropna().astype(str).str.strip().head(max_rows)
             for row_pos, v in series.items():
                 if not v or not v.replace(".", "", 1).replace("-", "", 1).isdigit():
                     continue  # keep numeric-looking values only
