@@ -67,6 +67,7 @@ CELL_REF_RE = re.compile(
 )
 
 
+@st.cache_data(show_spinner=False)
 def load_formulas(file_bytes):
     wb = load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
     formulas = {}
@@ -94,6 +95,7 @@ def _dedupe_headers(header):
     return deduped
 
 
+@st.cache_data(show_spinner=False)
 def load_raw_sheets(file_bytes):
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     raw = {}
@@ -114,6 +116,7 @@ def load_raw_sheets(file_bytes):
 # Cell-level graph + the set of sheet-pairs that DO have a formula link
 # ---------------------------------------------------------------------
 
+@st.cache_data(show_spinner=False)
 def build_cell_graph_and_pairs(formulas, sheetnames):
     lookup = {s.lower(): s for s in sheetnames}
     graph = {}
@@ -145,7 +148,16 @@ def build_cell_graph_and_pairs(formulas, sheetnames):
 # text too would flag common labels ("Total", "Yes") as false positives.
 # ---------------------------------------------------------------------
 
-def find_adjustments(raw_sheets, formula_pairs, max_rows=300, max_cols=15):
+@st.cache_data(show_spinner=False)
+def find_adjustments(raw_sheets, formula_pairs, max_rows=300, max_cols=15, max_occurrences=40):
+    """
+    max_occurrences: skip any value that shows up more than this many
+    times across the workbook (e.g. 0, blank-fill numbers). Those are
+    almost never meaningful adjustments, and without this cap a single
+    common value can generate tens of thousands of pairwise comparisons
+    on its own -- that combinatorial blowup, not the file read itself,
+    is usually what makes this feel slow to load.
+    """
     value_locations = {}  # value string -> [(sheet, cell), ...]
 
     for sheet, df in raw_sheets.items():
@@ -164,7 +176,7 @@ def find_adjustments(raw_sheets, formula_pairs, max_rows=300, max_cols=15):
     adjustments = []
     seen_pairs = set()
     for value, locations in value_locations.items():
-        if len(locations) < 2:
+        if len(locations) < 2 or len(locations) > max_occurrences:
             continue
         for i in range(len(locations)):
             for j in range(i + 1, len(locations)):
