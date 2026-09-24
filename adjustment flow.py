@@ -1,43 +1,49 @@
 """
 adjustment_flow.py
 ------------------
-Interactive three-bucket flow (Inputs -> Calculations -> Outputs) of an
-adjustment process, built from a table with the columns:
+Interactive three-bucket flow (Inputs -> Calculations -> Outputs) for one
+or MANY adjustment tables, all in a single HTML file with a dropdown to
+switch between them.
+
+Each table needs these column headers (spelling/order are flexible):
 
     Stage | Step No. | Report/Schedule | System/Location | Action | I/O | Standard
 
-Arrows are drawn two ways (both can be toggled in the page):
-  * File-match (solid, yellow): a step links to the most recent EARLIER
-    step that touched the same System/Location - e.g. step 4 uploads
-    TB_Q3.xlsx and step 7 downloads TB_Q3.xlsx -> 4 feeds 7.
-  * Step order (dashed, grey): step n -> the next step, skipped where a
+How tables are found
+  * Every sheet of every workbook you pass is scanned for header rows.
+  * One sheet can hold several tables stacked vertically: each header row
+    starts a new table. Blank rows and single-cell note/title rows are
+    skipped, so leaving gaps or titles between tables is fine.
+  * The name shown in the dropdown is, in order of preference:
+      1. a one-cell title just above the header row (e.g. "Deferred Tax Adj")
+      2. the Excel Table name, if the range is formatted as an Excel Table
+      3. the sheet name - with (2), (3)... if that sheet has several tables
+    With several workbooks, the workbook name is put in front.
+
+Arrows (both can be toggled in the page)
+  * File-match (solid yellow): a step links to the most recent EARLIER step
+    in the same table that touched the same System/Location.
+  * Step order (dashed grey): step n -> next step, skipped where a
     file-match arrow already joins the same pair.
 
-Clicking a step highlights its file lineage and shows every detail in the
-right-hand panel: all columns (including any extra columns in the sheet),
-what feeds it, what it feeds, previous/next step, and every step that
-touched the same file.
-
-Also flags: blank / duplicate / skipped step numbers, Stage vs I/O
-mismatches, blank System/Location, and file names that look like the
-same file written differently (e.g. M1_Workpaper.xlsx vs M1 Workpaper.xlsx).
-
-Header matching is forgiving: "Step No.", "Step no", "STEP #" etc. all work.
-A System/Location cell with several files can separate them with ; , or a
-new line.
+Checks per table: blank / duplicate / skipped step numbers, Stage vs I/O
+mismatch, blank System/Location, and file names that look like the same
+file written differently (e.g. M1_Workpaper.xlsx vs M1 Workpaper.xlsx).
 
 The graph library (vis-network 9.1.9, Apache-2.0/MIT) is bundled at the
-bottom of this file and copied INSIDE every HTML it creates, so the HTML
-works on any computer, offline, with nothing else needed. This script also
-needs nothing else - no extra .js file, no internet.
+bottom of this file and copied INSIDE the HTML, so the HTML works on any
+computer, offline, as a single file.
 
 Requires: pip install openpyxl
 
 Usage:
-    python adjustment_flow.py Adjustment_Flow.xlsx
-    python adjustment_flow.py Adjustment_Flow.xlsx "Sheet Name"
+    python adjustment_flow.py Adjustments.xlsx
+    python adjustment_flow.py Q3_Adjustments.xlsx Q4_Adjustments.xlsx
+    python adjustment_flow.py Adjustments.xlsx --sheet "Deferred Tax"
+    python adjustment_flow.py Adjustments.xlsx -o All_Flows.html
 """
 
+import argparse
 import base64
 import json
 import re
@@ -47,6 +53,7 @@ import zlib
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.utils import range_boundaries
 
 FIELD_ALIASES = {
     "stage": ["stage"],
@@ -60,6 +67,7 @@ FIELD_ALIASES = {
 }
 REQUIRED = ["stage", "step", "report", "location"]
 LOCATION_SPLIT = re.compile(r"[;,\n]")
+
 
 def get_vis_js():
     """Return the vis-network 9.1.9 graph library (bundled below, compressed)."""
@@ -107,7 +115,7 @@ def step_sort_key(step):
     return (0, float(m.group())) if m else (1, 0.0)
 
 
-# ---------------------------------------------------------------- reading
+# ---------------------------------------------------------------- finding tables
 def match_headers(cells):
     colmap = {}
     for idx, v in enumerate(cells):
@@ -121,50 +129,99 @@ def match_headers(cells):
     return colmap
 
 
-def find_table(wb, sheet_name=None):
-    if sheet_name:
-        if sheet_name not in wb.sheetnames:
-            print(f"No sheet called '{sheet_name}'. Sheets found: {wb.sheetnames}")
-            sys.exit(1)
-        sheets = [wb[sheet_name]]
-    else:
+def filled(row):
+    return [clean(v) for v in row if clean(v)]
+
+
+def title_above(rows, header_idx, floor_idx):
+    """A one-cell text row just above the header (blank rows skipped)."""
+    i = header_idx - 1
+    while i >= floor_idx:
+        vals = filled(rows[i])
+        if vals:
+            return vals[0] if len(vals) == 1 else None
+        i -= 1
+    return None
+
+
+def excel_table_names(ws):
+    """Map header row number -> Excel Table name, for ranges formatted as Tables."""
+    names = {}
+    try:
+        for name in list(ws.tables):
+            tbl = ws.tables[name]
+            _, min_row, _, _ = range_boundaries(tbl.ref)
+            names[min_row] = tbl.displayName or name
+    except Exception:
+        pass
+    return names
+
+
+def find_tables(ws):
+    rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+    headers = []
+    for i, r in enumerate(rows):
+        cm = match_headers(r)
+        if all(f in cm for f in REQUIRED):
+            headers.append((i, cm))
+
+    tbl_names = excel_table_names(ws)
+    tables = []
+    for n, (h, colmap) in enumerate(headers):
+        end = headers[n + 1][0] if n + 1 < len(headers) else len(rows)
+        floor = headers[n - 1][0] + 1 if n else 0
+        data = []
+        for j in range(h + 1, end):
+            r = rows[j]
+            known = sum(1 for c in colmap.values() if c < len(r) and clean(r[c]))
+            if known >= 2:  # real step rows fill several columns; titles/notes don't
+                data.append((j + 1, r))
+        tables.append({
+            "sheet": ws.title, "header_row": h + 1, "colmap": colmap,
+            "header": list(rows[h]), "rows": data,
+            "title": title_above(rows, h, floor),
+            "excel_table": tbl_names.get(h + 1),
+        })
+    return tables
+
+
+def load_flows(paths, sheet_filter=None):
+    flows = []
+    for path in paths:
+        wb = load_workbook(path, data_only=True)
         sheets = wb.worksheets
+        if sheet_filter:
+            sheets = [ws for ws in sheets if ws.title == sheet_filter]
+            if not sheets:
+                print(f"{path.name}: no sheet called '{sheet_filter}' "
+                      f"(sheets: {wb.sheetnames})")
+        for ws in sheets:
+            tables = [t for t in find_tables(ws) if t["rows"]]
+            for k, t in enumerate(tables, start=1):
+                name = (t["title"] or t["excel_table"]
+                        or (ws.title if len(tables) == 1 else f"{ws.title} ({k})"))
+                if len(paths) > 1:
+                    name = f"{path.stem} - {name}"
+                flows.append({"name": name, "file": path.name, "table": t})
+        wb.close()
 
-    best = None  # (ws, header_row, colmap, header_cells)
-    for ws in sheets:
-        for r_idx, row in enumerate(
-                ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
-            colmap = match_headers(row)
-            if best is None or len(colmap) > len(best[2]):
-                best = (ws, r_idx, colmap, list(row))
-
-    if best is None:
-        print("The workbook looks empty.")
-        sys.exit(1)
-    missing = [f for f in REQUIRED if f not in best[2]]
-    if missing:
-        print(f"Couldn't find column(s) {missing} in any sheet's header row "
-              f"(best match: '{best[0].title}', row {best[1]}).")
-        sys.exit(1)
-    return best
+    seen = {}
+    for f in flows:
+        base = f["name"]
+        seen[base] = seen.get(base, 0) + 1
+        if seen[base] > 1:
+            f["name"] = f"{base} ({seen[base]})"
+    return flows
 
 
-def load_steps(path, sheet_name=None):
-    wb = load_workbook(path, data_only=True, read_only=True)
-    ws, header_row, colmap, header_cells = find_table(wb, sheet_name)
-    sheet_used = ws.title
-
+def table_to_steps(table, prefix):
+    colmap = table["colmap"]
     known_idx = set(colmap.values())
-    extra_cols = [(i, clean(h)) for i, h in enumerate(header_cells)
+    extra_cols = [(i, clean(h)) for i, h in enumerate(table["header"])
                   if clean(h) and i not in known_idx]
 
     steps = []
-    for excel_row, row in enumerate(
-            ws.iter_rows(min_row=header_row + 1, values_only=True),
-            start=header_row + 1):
-        if row is None or all(clean(v) == "" for v in row):
-            continue
-
+    for excel_row, row in table["rows"]:
         def get(field):
             i = colmap.get(field)
             return clean(row[i]) if i is not None and i < len(row) else ""
@@ -172,7 +229,7 @@ def load_steps(path, sheet_name=None):
         stage = get("stage")
         location = get("location")
         steps.append({
-            "id": f"R{excel_row}",
+            "id": f"{prefix}R{excel_row}",
             "row": excel_row,
             "step": get("step"),
             "stage": stage,
@@ -186,10 +243,8 @@ def load_steps(path, sheet_name=None):
             "extras": [[h, clean(row[i])] for i, h in extra_cols
                        if i < len(row) and clean(row[i])],
         })
-    wb.close()
-
     steps.sort(key=lambda s: (step_sort_key(s["step"]), s["row"]))
-    return steps, sheet_used
+    return steps
 
 
 # ---------------------------------------------------------------- linking
@@ -280,10 +335,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   #flow { flex:3 1 0; height:100vh; }
   #sidebar { flex:1 1 0; min-width:340px; max-width:440px; height:100vh; box-sizing:border-box;
              background:#1a1a1a; padding:16px; overflow-y:auto; }
-  h2 { margin:0 0 6px; font-size:18px; }
+  h2 { margin:0 0 8px; font-size:18px; }
   h3 { font-size:16px; margin:14px 0 8px; }
   h4 { font-size:12px; margin:16px 0 6px; color:#FBCE07; text-transform:uppercase; letter-spacing:.5px; }
   .muted { color:#888; font-size:13px; font-style:italic; }
+  #flowPicker { margin-bottom:10px; }
+  #flowSelect { width:100%; box-sizing:border-box; padding:8px; font-size:14px; background:#232323;
+                color:#fff; border:1px solid #FBCE07; border-radius:4px; cursor:pointer; }
+  .navrow { display:flex; justify-content:space-between; font-size:13px; margin-top:6px; }
   .controls { font-size:13px; margin:10px 0; line-height:1.9; }
   .controls label { margin-right:12px; cursor:pointer; }
   .link { cursor:pointer; color:#FBCE07; text-decoration:underline; }
@@ -292,12 +351,12 @@ HTML_TEMPLATE = r"""<!doctype html>
   .legend { font-size:12px; line-height:1.9; margin-bottom:6px; }
   .sw { display:inline-block; width:12px; height:12px; border-radius:2px; vertical-align:middle; margin-right:4px; }
   .swb { display:inline-block; width:8px; height:8px; border:3px solid; border-radius:2px; vertical-align:middle; margin-right:4px; }
+  .ln { display:inline-block; width:22px; vertical-align:middle; margin-right:4px; }
   .issue { color:#e74c3c; font-size:13px; margin-bottom:5px; }
   .issue[data-id] { cursor:pointer; }
   .issue[data-id]:hover { text-decoration:underline; }
   details summary { cursor:pointer; font-size:13px; color:#e74c3c; margin:6px 0; }
   .ok { color:#2ecc71; font-size:13px; }
-  .ln { display:inline-block; width:22px; vertical-align:middle; margin-right:4px; }
   table.kv { width:100%; border-collapse:collapse; font-size:13px; }
   table.kv td { padding:5px 6px; border-bottom:1px solid #2c2c2c; vertical-align:top; word-break:break-word; }
   table.kv td:first-child { color:#aaa; width:38%; }
@@ -312,6 +371,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   <div id="flow"></div>
   <div id="sidebar">
     <h2>Adjustment Flow</h2>
+    <div id="flowPicker">
+      <select id="flowSelect"></select>
+      <div class="navrow">
+        <span class="link" id="prevFlow">&lsaquo; Previous</span>
+        <span class="muted" id="flowPos"></span>
+        <span class="link" id="nextFlow">Next &rsaquo;</span>
+      </div>
+    </div>
     <div id="summary" class="muted"></div>
     <div class="controls">
       <label><input type="checkbox" id="tFile" checked> File-match arrows</label>
@@ -321,21 +388,22 @@ HTML_TEMPLATE = r"""<!doctype html>
     <input id="search" placeholder="Search step, report or file, then press Enter">
     <div class="legend" id="legend"></div>
     <div id="issues"></div>
-    <div id="detail"><p class="muted">Click a step to see its details.</p></div>
+    <div id="detail"></div>
   </div>
 </div>
 <script>
 const D = __DATA__;
 
 const STAGE = {
-  Input:       { label:"INPUTS",       color:"#2ecc71", x:0 },
-  Calculation: { label:"CALCULATIONS", color:"#2a9d8f", x:430 },
-  Output:      { label:"OUTPUTS",      color:"#f39c12", x:860 },
+  Input:       { label:"INPUTS",        color:"#2ecc71", x:0 },
+  Calculation: { label:"CALCULATIONS",  color:"#2a9d8f", x:430 },
+  Output:      { label:"OUTPUTS",       color:"#f39c12", x:860 },
   Unassigned:  { label:"UNKNOWN STAGE", color:"#7f8c8d", x:1290 }
 };
 const ACTIONS = [["download","#3498db","Download"], ["upload","#9b59b6","Upload"], ["roll","#FBCE07","Rollforward"]];
 const OTHER_ACTION = "#dddddd";
 const ROW_GAP = 90, LANE_W = 380;
+const PLACEHOLDER = '<p class="muted">Click a step to see its details.</p>';
 
 function esc(v) {
   return String(v == null ? "" : v).replace(/[&<>"']/g, c =>
@@ -353,53 +421,20 @@ function hexA(hex, a) {
 function locKey(l) { return l.toLowerCase().trim().split(/\s+/).join(" "); }
 function stepLabel(s) { return "Step " + esc(s.step || "?") + " · " + esc(s.report || "(no report name)"); }
 
-const byId = {};
-D.steps.forEach((s, i) => { byId[s.id] = s; s.order = i; });
-const issueIds = new Set(D.issues.filter(i => i.id).map(i => i.id));
-const lanesUsed = Object.keys(STAGE).filter(k => k !== "Unassigned" || D.steps.some(s => s.bucket === "Unassigned"));
+// ---------------- state for the flow currently shown
+let current = 0, flow = null, byId = {}, issueIds = new Set(), lanesUsed = [], maxY = 0, baseEdge = {};
+let lastQuery = "", hitIdx = 0;
 
-// ---------------- nodes & edges
-const nodes = new vis.DataSet(D.steps.map((s, i) => {
-  const fill = STAGE[s.bucket].color;
-  return {
-    id: s.id,
-    label: (issueIds.has(s.id) ? "⚠ " : "") + "Step " + (s.step || "?") + "\n" + (s.report || "(no report name)"),
-    x: STAGE[s.bucket].x, y: i * ROW_GAP,
-    shape: "box", borderWidth: 3, borderWidthSelected: 5, margin: 10,
-    widthConstraint: { minimum: 200, maximum: 240 },
-    color: { background: fill, border: actionColor(s.action),
-             highlight: { background: fill, border: "#ffffff" },
-             hover: { background: fill, border: "#ffffff" } },
-    font: { color: "#111111", size: 14, face: "Segoe UI, Arial" },
-    title: (s.location || "(no location)") + "\nAction: " + (s.action || "-")
-  };
-}));
-
-const edgeList = [];
-D.dataEdges.forEach((e, i) => edgeList.push({
-  id: "F" + i, from: e.from, to: e.to, kind: "file", width: 2,
-  color: { color: "#FBCE07", highlight: "#FBCE07", hover: "#FBCE07" }, arrows: "to",
-  title: "Same file: " + e.files.join(", "),
-  smooth: { type: "curvedCW", roundness: 0.15 }
-}));
-D.seqEdges.forEach((e, i) => edgeList.push({
-  id: "Q" + i, from: e.from, to: e.to, kind: "seq", width: 1, dashes: true,
-  color: { color: "#666666", highlight: "#666666", hover: "#666666" }, arrows: "to", title: "Next step in order",
-  smooth: { type: "curvedCCW", roundness: 0.1 }
-}));
-const edges = new vis.DataSet(edgeList);
-const baseEdge = {};
-edgeList.forEach(e => baseEdge[e.id] = { color: e.color.color, width: e.width });
-
+const nodes = new vis.DataSet(), edges = new vis.DataSet();
 const network = new vis.Network(document.getElementById("flow"), { nodes, edges }, {
   physics: false,
   interaction: { hover: true, tooltipDelay: 150, keyboard: true },
   edges: { arrows: { to: { enabled: true, scaleFactor: 0.7 } } }
 });
 
-// ---------------- bucket lanes drawn behind the graph
-const maxY = Math.max(0, (D.steps.length - 1) * ROW_GAP);
+// bucket lanes drawn behind the graph
 network.on("beforeDrawing", ctx => {
+  if (!flow) return;
   const top = -130, h = maxY + 230;
   lanesUsed.forEach(k => {
     const L = STAGE[k];
@@ -414,6 +449,70 @@ network.on("beforeDrawing", ctx => {
     ctx.fillText(L.label, L.x, top + 38);
   });
 });
+
+function makeNode(s, i) {
+  const fill = STAGE[s.bucket].color;
+  return {
+    id: s.id,
+    label: (issueIds.has(s.id) ? "⚠ " : "") + "Step " + (s.step || "?") + "\n" + (s.report || "(no report name)"),
+    x: STAGE[s.bucket].x, y: i * ROW_GAP,
+    shape: "box", borderWidth: 3, borderWidthSelected: 5, margin: 10,
+    widthConstraint: { minimum: 200, maximum: 240 },
+    color: { background: fill, border: actionColor(s.action),
+             highlight: { background: fill, border: "#ffffff" },
+             hover: { background: fill, border: "#ffffff" } },
+    font: { color: "#111111", size: 14, face: "Segoe UI, Arial" },
+    title: (s.location || "(no location)") + "\nAction: " + (s.action || "-")
+  };
+}
+
+function makeEdges(f) {
+  const list = [];
+  f.dataEdges.forEach((e, i) => list.push({
+    id: "F" + i, from: e.from, to: e.to, kind: "file", width: 2,
+    color: { color: "#FBCE07", highlight: "#FBCE07", hover: "#FBCE07" }, arrows: "to",
+    title: "Same file: " + e.files.join(", "),
+    smooth: { type: "curvedCW", roundness: 0.15 }
+  }));
+  f.seqEdges.forEach((e, i) => list.push({
+    id: "Q" + i, from: e.from, to: e.to, kind: "seq", width: 1, dashes: true,
+    color: { color: "#666666", highlight: "#666666", hover: "#666666" }, arrows: "to",
+    title: "Next step in order",
+    smooth: { type: "curvedCCW", roundness: 0.1 }
+  }));
+  return list;
+}
+
+// ---------------- switching flows
+function loadFlow(i) {
+  current = i;
+  flow = D.flows[i];
+  byId = {};
+  flow.steps.forEach((s, k) => { byId[s.id] = s; s.order = k; });
+  issueIds = new Set(flow.issues.filter(x => x.id).map(x => x.id));
+  lanesUsed = Object.keys(STAGE).filter(k => k !== "Unassigned" || flow.steps.some(s => s.bucket === "Unassigned"));
+  maxY = Math.max(0, (flow.steps.length - 1) * ROW_GAP);
+
+  nodes.clear();
+  edges.clear();
+  nodes.add(flow.steps.map(makeNode));
+  const list = makeEdges(flow);
+  baseEdge = {};
+  list.forEach(e => baseEdge[e.id] = { color: e.color.color, width: e.width });
+  edges.add(list);
+  applyToggles();
+
+  lastQuery = "";
+  document.getElementById("search").value = "";
+  document.getElementById("detail").innerHTML = PLACEHOLDER;
+  document.getElementById("flowSelect").value = String(i);
+  document.getElementById("flowPos").textContent = (i + 1) + " of " + D.flows.length;
+  document.title = flow.name + " - Adjustment Flow";
+  renderSummary();
+  renderIssues();
+  try { history.replaceState(null, "", "#flow=" + i); } catch (e) {}
+  network.fit();
+}
 
 // ---------------- highlighting (follows file-match lineage)
 function walk(start, dir) {
@@ -432,25 +531,25 @@ function walk(start, dir) {
   return { nodes: found, edges: used };
 }
 
+function edgeStyle(e, on) {
+  const b = baseEdge[e.id];
+  return { id: e.id, color: { color: b.color, highlight: b.color, hover: b.color, opacity: on ? 1 : 0.12 },
+           width: on === "strong" ? b.width + 1.5 : b.width };
+}
+
 function highlight(id) {
   const up = walk(id, "up"), down = walk(id, "down");
   const keepN = new Set([id, ...up.nodes, ...down.nodes]);
   const keepE = new Set([...up.edges, ...down.edges]);
   nodes.update(nodes.getIds().map(n => ({ id: n, opacity: keepN.has(n) ? 1 : 0.2 })));
-  edges.update(edges.get().map(e => ({
-    id: e.id,
-    color: { color: baseEdge[e.id].color, highlight: baseEdge[e.id].color, hover: baseEdge[e.id].color, opacity: keepE.has(e.id) ? 1 : 0.12 },
-    width: keepE.has(e.id) ? baseEdge[e.id].width + 1.5 : baseEdge[e.id].width
-  })));
+  edges.update(edges.get().map(e => edgeStyle(e, keepE.has(e.id) ? "strong" : false)));
 }
 
 function clearAll() {
   nodes.update(nodes.getIds().map(n => ({ id: n, opacity: 1 })));
-  edges.update(edges.get().map(e => ({
-    id: e.id, color: { color: baseEdge[e.id].color, highlight: baseEdge[e.id].color, hover: baseEdge[e.id].color, opacity: 1 }, width: baseEdge[e.id].width
-  })));
+  edges.update(edges.get().map(e => edgeStyle(e, true)));
   network.unselectAll();
-  document.getElementById("detail").innerHTML = '<p class="muted">Click a step to see its details.</p>';
+  document.getElementById("detail").innerHTML = PLACEHOLDER;
 }
 
 // ---------------- side panel
@@ -469,10 +568,10 @@ function showDetail(id) {
     (v === "" || v == null ? '<span class="muted">-</span>' : esc(v).replace(/\n/g, "<br>")) +
     "</td></tr>").join("") + "</table>";
 
-  const mine = D.issues.filter(i => i.id === id);
+  const mine = flow.issues.filter(i => i.id === id);
   if (mine.length) h += "<h4>Issues</h4>" + mine.map(i => '<div class="issue">⚠ ' + esc(i.msg) + "</div>").join("");
 
-  const inE = D.dataEdges.filter(e => e.to === id), outE = D.dataEdges.filter(e => e.from === id);
+  const inE = flow.dataEdges.filter(e => e.to === id), outE = flow.dataEdges.filter(e => e.from === id);
   h += "<h4>Comes from (same file)</h4>" + (inE.length
     ? inE.map(e => itemHtml(byId[e.from], "via " + e.files.join(", "))).join("")
     : '<p class="muted">No earlier step uses this file.</p>');
@@ -480,14 +579,14 @@ function showDetail(id) {
     ? outE.map(e => itemHtml(byId[e.to], "via " + e.files.join(", "))).join("")
     : '<p class="muted">No later step uses this file.</p>');
 
-  const prev = D.steps[s.order - 1], next = D.steps[s.order + 1];
+  const prev = flow.steps[s.order - 1], next = flow.steps[s.order + 1];
   h += "<h4>Step order</h4>" + (prev ? itemHtml(prev, "Previous step") : "") +
        (next ? itemHtml(next, "Next step") : "") +
        (!prev && !next ? '<p class="muted">This is the only step.</p>' : "");
 
   s.locations.forEach(loc => {
     const k = locKey(loc);
-    const hist = D.steps.filter(o => o.locations.some(l => locKey(l) === k));
+    const hist = flow.steps.filter(o => o.locations.some(l => locKey(l) === k));
     h += '<h4>Every step touching "' + esc(loc) + '"</h4>' +
          hist.map(o => itemHtml(o, (o.action || "-") + (o.id === id ? "   ← this step" : ""))).join("");
   });
@@ -501,6 +600,28 @@ function selectStep(id, focus) {
   showDetail(id);
 }
 
+function renderSummary() {
+  const counts = {};
+  flow.steps.forEach(s => counts[s.bucket] = (counts[s.bucket] || 0) + 1);
+  document.getElementById("summary").textContent =
+    flow.steps.length + " steps · " + lanesUsed.map(k => (counts[k] || 0) + " " + k.toLowerCase()).join(", ") +
+    " · " + flow.dataEdges.length + " file links · " + flow.file + " › " + flow.sheet +
+    " (header row " + flow.headerRow + ")";
+}
+
+function renderIssues() {
+  const div = document.getElementById("issues");
+  if (flow.issues.length) {
+    div.innerHTML = "<details" + (flow.issues.length <= 8 ? " open" : "") + "><summary>⚠ " +
+      flow.issues.length + " issue(s) found</summary>" + flow.issues.map(i =>
+        '<div class="issue"' + (i.id ? ' data-id="' + i.id + '"' : "") + ">" +
+        (i.id ? stepLabel(byId[i.id]) + ": " : "") + esc(i.msg) + "</div>").join("") + "</details>";
+  } else {
+    div.innerHTML = '<div class="ok">✓ No issues found</div>';
+  }
+}
+
+// ---------------- events
 network.on("click", p => {
   if (p.nodes.length) selectStep(p.nodes[0], false);
   else if (!p.edges.length) clearAll();
@@ -510,7 +631,6 @@ document.getElementById("sidebar").addEventListener("click", ev => {
   if (el && byId[el.dataset.id]) selectStep(el.dataset.id, true);
 });
 
-// ---------------- controls
 function applyToggles() {
   const f = document.getElementById("tFile").checked, q = document.getElementById("tSeq").checked;
   edges.update(edges.get().map(e => ({ id: e.id, hidden: e.kind === "file" ? !f : !q })));
@@ -519,12 +639,11 @@ document.getElementById("tFile").addEventListener("change", applyToggles);
 document.getElementById("tSeq").addEventListener("change", applyToggles);
 document.getElementById("resetBtn").addEventListener("click", () => { clearAll(); network.fit({ animation: true }); });
 
-let lastQuery = "", hitIdx = 0;
 document.getElementById("search").addEventListener("keydown", ev => {
   if (ev.key !== "Enter") return;
   const q = ev.target.value.trim().toLowerCase();
   if (!q) return;
-  const hits = D.steps.filter(s => [s.step, s.report, s.location, s.action, s.standard]
+  const hits = flow.steps.filter(s => [s.step, s.report, s.location, s.action, s.standard]
     .join(" ").toLowerCase().includes(q));
   if (!hits.length) { ev.target.style.borderColor = "#e74c3c"; return; }
   ev.target.style.borderColor = "#444";
@@ -533,79 +652,97 @@ document.getElementById("search").addEventListener("keydown", ev => {
   selectStep(hits[hitIdx].id, true);
 });
 
-// ---------------- summary, legend, issues
-const counts = {};
-D.steps.forEach(s => counts[s.bucket] = (counts[s.bucket] || 0) + 1);
-document.getElementById("summary").textContent =
-  D.steps.length + " steps · " + lanesUsed.map(k => (counts[k] || 0) + " " + k.toLowerCase()).join(", ") +
-  " · " + D.dataEdges.length + " file links · sheet '" + D.sheet + "'";
+// flow picker
+const sel = document.getElementById("flowSelect");
+sel.innerHTML = D.flows.map((f, i) =>
+  '<option value="' + i + '">' + esc(f.name) + " — " + f.steps.length + " steps" +
+  (f.issues.length ? " · ⚠ " + f.issues.length : "") + "</option>").join("");
+sel.addEventListener("change", () => loadFlow(parseInt(sel.value, 10)));
+document.getElementById("prevFlow").addEventListener("click", () =>
+  loadFlow((current - 1 + D.flows.length) % D.flows.length));
+document.getElementById("nextFlow").addEventListener("click", () =>
+  loadFlow((current + 1) % D.flows.length));
+if (D.flows.length < 2) document.getElementById("flowPicker").style.display = "none";
 
+// legend
 document.getElementById("legend").innerHTML =
-  lanesUsed.map(k => '<span class="sw" style="background:' + STAGE[k].color + '"></span>' + k).join(" &nbsp; ") + "<br>" +
+  ["Input", "Calculation", "Output"].map(k => '<span class="sw" style="background:' + STAGE[k].color + '"></span>' + k).join(" &nbsp; ") + "<br>" +
   ACTIONS.map(([, c, n]) => '<span class="swb" style="border-color:' + c + '"></span>' + n).join(" &nbsp; ") +
   ' &nbsp; <span class="swb" style="border-color:' + OTHER_ACTION + '"></span>Other<br>' +
   '<span class="ln" style="border-top:2px solid #FBCE07"></span>Same file &nbsp; ' +
   '<span class="ln" style="border-top:2px dashed #888"></span>Step order';
 
-const issuesDiv = document.getElementById("issues");
-if (D.issues.length) {
-  issuesDiv.innerHTML = "<details" + (D.issues.length <= 8 ? " open" : "") + "><summary>⚠ " +
-    D.issues.length + " issue(s) found</summary>" + D.issues.map(i =>
-      '<div class="issue"' + (i.id ? ' data-id="' + i.id + '"' : "") + ">" +
-      (i.id ? stepLabel(byId[i.id]) + ": " : "") + esc(i.msg) + "</div>").join("") + "</details>";
-} else {
-  issuesDiv.innerHTML = '<div class="ok">✓ No issues found</div>';
-}
+// start on the flow in the URL (#flow=N) or the first one
+const m = /flow=(\d+)/.exec(location.hash);
+loadFlow(m && +m[1] < D.flows.length ? +m[1] : 0);
 </script>
 </body>
 </html>
 """
 
 
-def build_html(steps, data_edges, seq_edges, issues, sheet):
-    payload = {"steps": steps, "dataEdges": data_edges, "seqEdges": seq_edges,
-               "issues": issues, "sheet": sheet}
-    data_json = json.dumps(payload).replace("</", "<\\/")
+def build_html(flows_payload):
+    data_json = json.dumps({"flows": flows_payload}).replace("</", "<\\/")
     vis_js = get_vis_js().replace("</script", "<\\/script")
     return HTML_TEMPLATE.replace("__DATA__", data_json).replace("__VISJS__", vis_js)
 
 
 # ---------------------------------------------------------------- main
 def main():
-    if len(sys.argv) < 2:
-        print('Usage: python adjustment_flow.py Adjustment_Flow.xlsx ["Sheet Name"]')
+    ap = argparse.ArgumentParser(
+        description="Build one interactive adjustment-flow HTML from Excel tables.")
+    ap.add_argument("files", nargs="+", help="one or more .xlsx files")
+    ap.add_argument("--sheet", help="only read this sheet (exact tab name)")
+    ap.add_argument("-o", "--output", help="output HTML file name")
+    args = ap.parse_args()
+
+    paths = [Path(p) for p in args.files]
+    for p in paths:
+        if not p.exists():
+            print(f"File not found: {p}")
+            sys.exit(1)
+
+    flows = load_flows(paths, args.sheet)
+    if not flows:
+        print("No tables found. Each table needs a header row with at least "
+              "Stage, Step No., Report/Schedule and System/Location.")
         sys.exit(1)
-    path = Path(sys.argv[1])
-    sheet = sys.argv[2] if len(sys.argv) > 2 else None
 
-    steps, sheet_used = load_steps(path, sheet)
-    if not steps:
-        print(f"No data rows found under the header in '{sheet_used}'.")
-        sys.exit(1)
+    payload = []
+    total_issues = 0
+    for idx, f in enumerate(flows):
+        t = f["table"]
+        steps = table_to_steps(t, f"F{idx}-")
+        data_edges, seq_edges = build_edges(steps)
+        issues = find_issues(steps)
+        total_issues += len(issues)
+        payload.append({
+            "name": f["name"], "file": f["file"], "sheet": t["sheet"],
+            "headerRow": t["header_row"], "steps": steps,
+            "dataEdges": data_edges, "seqEdges": seq_edges, "issues": issues,
+        })
 
-    data_edges, seq_edges = build_edges(steps)
-    issues = find_issues(steps)
-
-    buckets = {}
-    for s in steps:
-        buckets[s["bucket"]] = buckets.get(s["bucket"], 0) + 1
-    print(f"Loaded {len(steps)} step(s) from '{sheet_used}': "
-          + ", ".join(f"{v} {k}" for k, v in buckets.items()))
-    print(f"{len(data_edges)} file-match link(s), {len(seq_edges)} step-order link(s).")
-
-    if issues:
-        print(f"\n{len(issues)} issue(s):")
+        counts = {}
+        for s in steps:
+            counts[s["bucket"]] = counts.get(s["bucket"], 0) + 1
+        print(f"\n[{idx + 1}] {f['name']}   ({f['file']} > '{t['sheet']}', header row {t['header_row']})")
+        print(f"    {len(steps)} step(s): " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        print(f"    {len(data_edges)} file-match link(s), {len(seq_edges)} step-order link(s)")
         for i in issues:
             who = next((f"Step {s['step'] or '?'} (row {s['row']})"
                         for s in steps if s["id"] == i["id"]), "General")
-            print(f"  {who}: {i['msg']}")
-    else:
-        print("No issues found.")
+            print(f"    ! {who}: {i['msg']}")
 
-    out = path.with_name(path.stem + "_flow.html")
-    out.write_text(build_html(steps, data_edges, seq_edges, issues, sheet_used),
-                   encoding="utf-8")
-    print(f"\nWritten to {out} - opening in your browser now.")
+    if args.output:
+        out = Path(args.output)
+    elif len(paths) == 1:
+        out = paths[0].with_name(paths[0].stem + "_flow.html")
+    else:
+        out = paths[0].with_name("adjustment_flows.html")
+
+    out.write_text(build_html(payload), encoding="utf-8")
+    print(f"\n{len(flows)} flow(s), {total_issues} issue(s) in total.")
+    print(f"Written to {out} - opening in your browser now.")
     webbrowser.open(out.resolve().as_uri())
 
 
