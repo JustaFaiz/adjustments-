@@ -220,13 +220,13 @@ if not uploads:
         "Each adjustment starts with a details row (**Temp/Perm, name, Return (CY) + amount**), "
         "followed by up to four tables - **Input, Process, Output - Internal, Output - External** - "
         "each with the columns **Sequence, Name, Type, Source, Classification Basis, "
-        "Work Paper Name, Work Paper Sheet**.")
+        "Work Paper Name, Work Paper Sheet** (outputs use **Process** and **Format / Basis**).")
     st.stop()
 
 flows = parse(tuple((u.name, u.getvalue()) for u in uploads), sheet.strip())
 if not flows:
     st.error("No adjustments found. Each table needs a header row with at least "
-             "Sequence and Name.")
+             "Sequence and two other known columns.")
     st.stop()
 
 with st.sidebar:
@@ -296,7 +296,13 @@ tab_steps, tab_issues = st.tabs(["Steps table", f"Issues ({len(flow['issues'])})
 with tab_steps:
     rows = []
     for s in steps:
-        row = dict((k, v) for k, v in s["fields"])
+        # one set of columns for every stage (outputs call Name "Process"
+        # and Classification Basis "Format / Basis")
+        row = {"Stage": s["stage"], "Sequence": f"Step {s['step']}" if s["step"] else "",
+               "Name / Process": s["report"], "Type": s["action"], "Source": s["source"],
+               "Classification / Format Basis": s["standard"],
+               "Work Paper Name": s["location"], "Work Paper Sheet": s["wpSheet"]}
+        row.update(dict(s["extras"]))
         row["Excel row"] = s["row"]
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)

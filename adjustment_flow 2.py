@@ -2,34 +2,46 @@
 adjustment_flow.py
 ------------------
 Interactive dashboard of adjustment flows: summary cards on top, then the
-flow in three stacked bands - Inputs (top) -> Calculations -> Outputs
-(bottom) - with steps running left to right in step order. One or MANY
-tables go into a single HTML file, with a dropdown to switch between them.
+flow in stacked bands - Inputs (top) -> Process -> Outputs - Internal ->
+Outputs - External (bottom) - with steps running left to right in step
+order. One or MANY tables go into a single HTML file, with a dropdown to
+switch between them.
 
-Each table needs these column headers (spelling/order are flexible):
+Excel layout (all adjustments on one sheet, one below the other):
 
-    Stage | Step No. | Report/Schedule | System/Location | Action | I/O | Standard
+    Temp | Deferred Rent |  | Return (CY) | 125000.50      <- details row
+    Input                                                  <- stage label
+    Sequence | Name | Type | Source | Classification Basis | Work Paper Name | Work Paper Sheet
+    Step 1   | ...
+    Process
+    Sequence | Name | ...
+    Output - Internal
+    Sequence | Name | ...
+    Output - External
+    Sequence | Name | ...
 
-How tables are found
-  * Every sheet of every workbook you pass is scanned for header rows.
-  * One sheet can hold several tables stacked vertically: each header row
-    starts a new table. Blank rows and single-cell note/title rows are
-    skipped, so leaving gaps or titles between tables is fine.
-  * The name shown in the dropdown is, in order of preference:
-      1. a one-cell title just above the header row (e.g. "Deferred Tax Adj")
-      2. the Excel Table name, if the range is formatted as an Excel Table
-      3. the sheet name - with (2), (3)... if that sheet has several tables
-    With several workbooks, the workbook name is put in front.
+  * A details row (Temp/Perm, name, Return (CY) + amount) starts each
+    adjustment. The cells are found by content, so blank columns are fine.
+  * Each adjustment has up to four tables. A table's stage comes from the
+    label just above its header (Input / Process / Output - Internal /
+    Output - External). With no label, the table's position is used
+    (1st = Input, 2nd = Process, 3rd = Output - Internal, 4th = External).
+  * "Step 1" in Sequence is shown as Step 1 (the word isn't doubled).
+  * Header spelling/order is flexible. Output tables may use "Process"
+    instead of "Name" and "Format / Basis" instead of "Classification
+    Basis" - both are read into the same place.
+  * Work Paper Name is what links steps together (same work paper).
 
-Arrows (both can be toggled in the page)
+Arrows (can be toggled in the page)
   * File-match (solid yellow): a step links to the most recent EARLIER step
-    in the same table that touched the same System/Location.
+    in the same adjustment that used the same Work Paper Name.
   * Step order (dashed grey): step n -> next step, skipped where a
     file-match arrow already joins the same pair.
 
-Checks per table: blank / duplicate / skipped step numbers, Stage vs I/O
-mismatch, blank System/Location, and file names that look like the same
-file written differently (e.g. M1_Workpaper.xlsx vs M1 Workpaper.xlsx).
+Checks per adjustment: blank / duplicate / skipped sequence numbers (within
+each stage table), steps with neither Source nor Work Paper Name, and work
+paper names that look like the same file written differently
+(e.g. M1_Workpaper.xlsx vs M1 Workpaper.xlsx).
 
 The graph library (vis-network 9.1.9, Apache-2.0/MIT) is bundled at the
 bottom of this file and copied INSIDE the HTML, so the HTML works on any
@@ -57,16 +69,23 @@ from openpyxl import load_workbook
 from openpyxl.utils import range_boundaries
 
 FIELD_ALIASES = {
-    "stage": ["stage"],
-    "step": ["stepno", "step", "stepnumber", "stepnum", "stepnbr"],
-    "report": ["reportschedule", "report", "schedule", "reportorschedule"],
-    "location": ["systemlocation", "location", "system", "filename", "file",
-                 "systemorlocation"],
-    "action": ["action"],
-    "io": ["io", "inputoutput", "iotype"],
-    "standard": ["standard", "standards"],
+    "step": ["sequence", "seq", "sequenceno", "seqno", "stepno", "step"],
+    "report": ["name", "stepname", "process", "processname", "reportschedule", "report"],
+    "action": ["type", "steptype", "action"],
+    "source": ["source", "system", "sourcesystem"],
+    "standard": ["classificationbasis", "classification", "formatbasis", "formatorbasis",
+                 "format", "basis", "standard"],
+    "location": ["workpapername", "workpaper", "wpname", "workbook", "filename", "file"],
+    "wpsheet": ["workpapersheet", "wpsheet", "sheetname", "sheet", "tab"],
 }
-REQUIRED = ["stage", "step", "report", "location"]
+FIELD_LABELS = [("step", "Sequence"), ("report", "Name"), ("action", "Type"),
+                ("source", "Source"), ("standard", "Classification Basis"),
+                ("location", "Work Paper Name"), ("wpsheet", "Work Paper Sheet")]
+REQUIRED = ["step"]          # plus at least two other known columns (see is_header)
+
+
+def is_header(colmap):
+    return all(f in colmap for f in REQUIRED) and len(colmap) >= 3
 LOCATION_SPLIT = re.compile(r"[;,\n]")
 
 
@@ -98,17 +117,33 @@ def loose_loc_key(loc):
     return norm(base)
 
 
-def bucket_of(v):
-    s = norm(v)
-    if not s:
-        return None
-    if s == "i" or s.startswith("in"):
-        return "Input"
-    if s in ("c", "p") or s.startswith(("calc", "proc", "comp")):
-        return "Calculation"
-    if s == "o" or s.startswith("out"):
+BUCKET_ORDER = ["Input", "Calculation", "OutputInternal", "OutputExternal", "Output", "Unassigned"]
+STAGE_SEQUENCE = ["Input", "Calculation", "OutputInternal", "OutputExternal"]
+STAGE_NAMES = {"Input": "Input", "Calculation": "Process", "OutputInternal": "Output - Internal",
+               "OutputExternal": "Output - External", "Output": "Output", "Unassigned": "Unknown"}
+
+
+def stage_of_label(text):
+    """Stage label text -> bucket, e.g. 'Output - Internal', '3. Output External'."""
+    t = str(text).lower()
+    if "output" in t or t.strip() in ("o", "out"):
+        if "ext" in t:
+            return "OutputExternal"
+        if "int" in t:
+            return "OutputInternal"
         return "Output"
+    if "process" in t or "calc" in t:
+        return "Calculation"
+    if "input" in t:
+        return "Input"
     return None
+
+
+def step_display(v):
+    """'Step 1' -> '1', so labels read 'Step 1' rather than 'Step Step 1'."""
+    t = clean(v)
+    stripped = re.sub(r"^\s*step\s*[:#.\-]?\s*", "", t, flags=re.I)
+    return stripped or t
 
 
 def step_sort_key(step):
@@ -116,7 +151,7 @@ def step_sort_key(step):
     return (0, float(m.group())) if m else (1, 0.0)
 
 
-# ---------------------------------------------------------------- finding tables
+# ---------------------------------------------------------------- finding adjustments
 def match_headers(cells):
     colmap = {}
     for idx, v in enumerate(cells):
@@ -134,56 +169,124 @@ def filled(row):
     return [clean(v) for v in row if clean(v)]
 
 
-def title_above(rows, header_idx, floor_idx):
-    """A one-cell text row just above the header (blank rows skipped)."""
-    i = header_idx - 1
-    while i >= floor_idx:
-        vals = filled(rows[i])
-        if vals:
-            return vals[0] if len(vals) == 1 else None
-        i -= 1
-    return None
+TYPE_RE = re.compile(r"^(adj(ustment)?(\s*type)?\s*[:\-]?\s*)?(temp|temporary|perm|permanent)\b", re.I)
+LABEL_WORDS = {"adjustment", "adjustmentname", "name", "type", "adjustmenttype"}
+STEP_RE = re.compile(r"^\s*(step\s*)?\d", re.I)
 
 
-def excel_table_names(ws):
-    """Map header row number -> Excel Table name, for ranges formatted as Tables."""
-    names = {}
+def to_number(v):
+    """Excel value -> float, accepting '1,234.56', '(1,234.56)', '$1,234'."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip().replace(",", "").replace("$", "").replace(" ", "")
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()")
     try:
-        for name in list(ws.tables):
-            tbl = ws.tables[name]
-            _, min_row, _, _ = range_boundaries(tbl.ref)
-            names[min_row] = tbl.displayName or name
-    except Exception:
-        pass
-    return names
+        return -float(t) if neg else float(t)
+    except ValueError:
+        return None
 
 
-def find_tables(ws):
+def parse_details(row):
+    """Read 'Temp/Perm | Name | ... | Return (CY) | amount' from a row."""
+    cells = [(i, v) for i, v in enumerate(row) if clean(v)]
+    info = {"adjType": "", "adjName": "", "amountLabel": "", "amount": None}
+    type_i = label_i = None
+    for i, v in cells:
+        if isinstance(v, str) and TYPE_RE.match(v.strip()):
+            t = TYPE_RE.match(v.strip()).group(4).lower()
+            info["adjType"] = "Temporary" if t.startswith("temp") else "Permanent"
+            type_i = i
+            break
+    for i, v in cells:
+        low = str(v).lower()
+        if isinstance(v, str) and ("return" in low or re.search(r"\bcy\b", low)):
+            info["amountLabel"], label_i = clean(v), i
+            break
+    nums = [(i, to_number(v)) for i, v in cells if to_number(v) is not None]
+    if label_i is not None:
+        right = [(i, n) for i, n in nums if i > label_i]
+        if right:
+            info["amount"] = right[0][1]
+    elif nums:
+        info["amount"] = nums[-1][1]
+    for i, v in cells:
+        if i in (type_i, label_i) or to_number(v) is not None:
+            continue
+        if type_i is not None and i < type_i:
+            continue
+        if norm(v) in LABEL_WORDS:
+            continue
+        info["adjName"] = clean(v)
+        break
+    info["found"] = bool(info["adjType"] or info["amountLabel"])
+    return info
+
+
+def stage_label_row(row):
+    """A short label row such as 'Input' or 'Output - External' -> (bucket, text)."""
+    vals = filled(row)
+    if not vals or len(vals) > 2 or len(vals[0]) > 40:
+        return None
+    bucket = stage_of_label(vals[0])
+    return (bucket, vals[0]) if bucket else None
+
+
+def find_adjustments(ws):
+    """Walk the sheet top to bottom: details row -> stage label -> table -> ..."""
     rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
-    headers = []
-    for i, r in enumerate(rows):
-        cm = match_headers(r)
-        if all(f in cm for f in REQUIRED):
-            headers.append((i, cm))
+    adjustments, adj, table, pending_stage = [], None, None, None
 
-    tbl_names = excel_table_names(ws)
-    tables = []
-    for n, (h, colmap) in enumerate(headers):
-        end = headers[n + 1][0] if n + 1 < len(headers) else len(rows)
-        floor = headers[n - 1][0] + 1 if n else 0
-        data = []
-        for j in range(h + 1, end):
-            r = rows[j]
-            known = sum(1 for c in colmap.values() if c < len(r) and clean(r[c]))
-            if known >= 2:  # real step rows fill several columns; titles/notes don't
-                data.append((j + 1, r))
-        tables.append({
-            "sheet": ws.title, "header_row": h + 1, "colmap": colmap,
-            "header": list(rows[h]), "rows": data,
-            "title": title_above(rows, h, floor),
-            "excel_table": tbl_names.get(h + 1),
-        })
-    return tables
+    def new_adjustment(details=None, row_no=None):
+        a = {"sheet": ws.title, "details": details or {}, "details_row": row_no, "tables": []}
+        adjustments.append(a)
+        return a
+
+    for i, r in enumerate(rows):
+        if not filled(r):
+            continue
+        colmap = match_headers(r)
+        if is_header(colmap):                                       # table header
+            if adj is None:
+                adj = new_adjustment()
+            if pending_stage:
+                bucket, label = pending_stage
+            else:                                                   # no label: use position
+                k = len(adj["tables"])
+                bucket = STAGE_SEQUENCE[k] if k < len(STAGE_SEQUENCE) else "Unassigned"
+                label = STAGE_NAMES[bucket]
+            # a stage going "backwards" (e.g. Input after Output) means a new adjustment
+            if adj["tables"] and pending_stage and bucket in STAGE_SEQUENCE and \
+                    adj["tables"][-1]["bucket"] in STAGE_SEQUENCE and \
+                    STAGE_SEQUENCE.index(bucket) < STAGE_SEQUENCE.index(adj["tables"][-1]["bucket"]):
+                adj = new_adjustment()
+            table = {"bucket": bucket, "label": label, "header_row": i + 1,
+                     "colmap": colmap, "header": list(r), "rows": []}
+            adj["tables"].append(table)
+            pending_stage = None
+            continue
+
+        seq_cell = ""
+        if table:
+            ci = table["colmap"]["step"]
+            seq_cell = clean(r[ci]) if ci < len(r) else ""
+        if not STEP_RE.match(seq_cell):
+            d = parse_details(r)
+            if d["found"]:                                          # details row: new adjustment
+                adj, table, pending_stage = new_adjustment(d, i + 1), None, None
+                continue
+            lab = stage_label_row(r)
+            if lab:                                                 # stage label
+                pending_stage, table = lab, None
+                continue
+        if table:
+            cm = table["colmap"]
+            known = sum(1 for c in cm.values() if c < len(r) and clean(r[c]))
+            if known >= 2:                                          # a step
+                table["rows"].append((i + 1, r))
+    return [a for a in adjustments if any(t["rows"] for t in a["tables"])]
 
 
 def load_flows(paths, sheet_filter=None):
@@ -197,13 +300,13 @@ def load_flows(paths, sheet_filter=None):
                 print(f"{path.name}: no sheet called '{sheet_filter}' "
                       f"(sheets: {wb.sheetnames})")
         for ws in sheets:
-            tables = [t for t in find_tables(ws) if t["rows"]]
-            for k, t in enumerate(tables, start=1):
-                name = (t["title"] or t["excel_table"]
-                        or (ws.title if len(tables) == 1 else f"{ws.title} ({k})"))
+            adjs = find_adjustments(ws)
+            for k, a in enumerate(adjs, start=1):
+                name = a["details"].get("adjName") or \
+                    (ws.title if len(adjs) == 1 else f"{ws.title} ({k})")
                 if len(paths) > 1:
-                    name = f"{path.stem} - {name}"
-                flows.append({"name": name, "file": path.name, "table": t})
+                    name = f"{Path(path.name).stem} - {name}"
+                flows.append({"name": name, "file": path.name, "adjustment": a})
         wb.close()
 
     seen = {}
@@ -215,36 +318,46 @@ def load_flows(paths, sheet_filter=None):
     return flows
 
 
-def table_to_steps(table, prefix):
-    colmap = table["colmap"]
-    known_idx = set(colmap.values())
-    extra_cols = [(i, clean(h)) for i, h in enumerate(table["header"])
-                  if clean(h) and i not in known_idx]
-
+def adjustment_to_steps(adj, prefix):
     steps = []
-    for excel_row, row in table["rows"]:
-        def get(field):
-            i = colmap.get(field)
-            return clean(row[i]) if i is not None and i < len(row) else ""
+    for tno, table in enumerate(adj["tables"]):
+        colmap = table["colmap"]
+        known_idx = set(colmap.values())
+        extra_cols = [(i, clean(h)) for i, h in enumerate(table["header"])
+                      if clean(h) and i not in known_idx]
+        for excel_row, row in table["rows"]:
+            def get(field):
+                i = colmap.get(field)
+                return clean(row[i]) if i is not None and i < len(row) else ""
 
-        stage = get("stage")
-        location = get("location")
-        steps.append({
-            "id": f"{prefix}R{excel_row}",
-            "row": excel_row,
-            "step": get("step"),
-            "stage": stage,
-            "report": get("report"),
-            "location": location,
-            "action": get("action"),
-            "io": get("io"),
-            "standard": get("standard"),
-            "bucket": bucket_of(stage) or "Unassigned",
-            "locations": [l.strip() for l in LOCATION_SPLIT.split(location) if l.strip()],
-            "extras": [[h, clean(row[i])] for i, h in extra_cols
-                       if i < len(row) and clean(row[i])],
-        })
-    steps.sort(key=lambda s: (step_sort_key(s["step"]), s["row"]))
+            vals = {f: get(f) for f, _ in FIELD_LABELS}
+            vals["step"] = step_display(vals["step"])
+            location = vals["location"]
+            header_text = {f: clean(table["header"][i]) for f, i in colmap.items()}
+            extras = [[h, clean(row[i])] for i, h in extra_cols if i < len(row) and clean(row[i])]
+            fields = [["Stage", table["label"]]] + \
+                [[header_text.get(f) or lbl, ("Step " + vals[f]) if f == "step" and vals[f] else vals[f]]
+                 for f, lbl in FIELD_LABELS] + extras
+            steps.append({
+                "id": f"{prefix}R{excel_row}",
+                "row": excel_row,
+                "table": tno,
+                "stage": table["label"],
+                "bucket": table["bucket"],
+                "step": vals["step"],
+                "report": vals["report"],
+                "action": vals["action"],
+                "source": vals["source"],
+                "standard": vals["standard"],
+                "location": location,
+                "wpSheet": vals["wpsheet"],
+                "locations": [l.strip() for l in LOCATION_SPLIT.split(location) if l.strip()],
+                "fields": fields,
+                "extras": extras,
+            })
+    order = {b: n for n, b in enumerate(BUCKET_ORDER)}
+    steps.sort(key=lambda s: (order.get(s["bucket"], 99), s["table"],
+                              step_sort_key(s["step"]), s["row"]))
     return steps
 
 
@@ -275,36 +388,37 @@ def find_issues(steps):
     def add(step, msg):
         issues.append({"id": step["id"] if step else None, "msg": msg})
 
-    # Blank / duplicate step numbers
-    by_num = {}
+    # Blank / duplicate / skipped sequence numbers - checked within each stage table,
+    # so numbering that restarts at Step 1 in every table is fine
+    tables = {}
     for s in steps:
-        if not s["step"]:
-            add(s, "Step No. is blank")
-        else:
-            by_num.setdefault(s["step"], []).append(s)
-    for num, group in by_num.items():
-        if len(group) > 1:
-            for s in group:
-                add(s, f"Step No. {num} is used {len(group)} times")
+        tables.setdefault(s["table"], []).append(s)
+    for group_steps in tables.values():
+        stage = group_steps[0]["stage"]
+        by_num = {}
+        for s in group_steps:
+            if not s["step"]:
+                add(s, "Sequence is blank")
+            else:
+                by_num.setdefault(s["step"].lower(), []).append(s)
+        for num, group in by_num.items():
+            if len(group) > 1:
+                for s in group:
+                    add(s, f"Step {s['step']} is used {len(group)} times in {stage}")
+        ints = set()
+        for s in group_steps:
+            kind, val = step_sort_key(s["step"])
+            if kind == 0 and float(val).is_integer():
+                ints.add(int(val))
+        if ints:
+            skipped = sorted(set(range(min(ints), max(ints) + 1)) - ints)
+            if skipped:
+                add(None, f"{stage}: step number(s) skipped: " + ", ".join(map(str, skipped)))
 
-    # Skipped step numbers
-    ints = set()
+    # Nothing to say where the step's data comes from / goes
     for s in steps:
-        kind, val = step_sort_key(s["step"])
-        if kind == 0 and float(val).is_integer():
-            ints.add(int(val))
-    if ints:
-        skipped = sorted(set(range(min(ints), max(ints) + 1)) - ints)
-        if skipped:
-            add(None, "Step number(s) skipped: " + ", ".join(map(str, skipped)))
-
-    # Stage vs I/O mismatch, blank System/Location
-    for s in steps:
-        io_bucket = bucket_of(s["io"])
-        if s["bucket"] != "Unassigned" and io_bucket and io_bucket != s["bucket"]:
-            add(s, f"Stage says {s['stage']} but I/O says {s['io']}")
-        if not s["locations"]:
-            add(s, "System/Location is blank")
+        if not s["location"] and not s["source"]:
+            add(s, "Source and Work Paper Name are both blank")
 
     # Same file written differently
     groups = {}
@@ -389,7 +503,8 @@ HTML_TEMPLATE = r"""<!doctype html>
   </div>
   <div id="kpis"></div>
   <div class="toolbar">
-    <input id="search" placeholder="Search step, report or file + Enter">
+    <input id="search" placeholder="Search step, name, source or work paper + Enter">
+    <label title="One white arrow from each step to the next (1 → 2 → 3 …). Hides the other arrows."><input type="checkbox" id="tStep"> Step-by-step only</label>
     <label><input type="checkbox" id="tFile" checked> File-match arrows</label>
     <label><input type="checkbox" id="tSeq" checked> Step-order arrows</label>
     <span class="link" id="resetBtn">Reset view</span>
@@ -405,11 +520,24 @@ const D = __DATA__;
 
 // Buckets run top to bottom
 const STAGE = {
-  Input:       { label:"INPUTS",        short:"Inputs",        color:"#2ecc71", y:0 },
-  Calculation: { label:"CALCULATIONS",  short:"Calculations",  color:"#2a9d8f", y:260 },
-  Output:      { label:"OUTPUTS",       short:"Outputs",       color:"#f39c12", y:520 },
-  Unassigned:  { label:"UNKNOWN STAGE", short:"Unknown stage", color:"#7f8c8d", y:780 }
+  Input:          { label:"INPUTS",             short:"Inputs",           color:"#2ecc71", y:0 },
+  Calculation:    { label:"PROCESS",            short:"Process",          color:"#2a9d8f", y:0 },
+  OutputInternal: { label:"OUTPUT - INTERNAL", short:"Output - Internal", color:"#f39c12", y:0 },
+  OutputExternal: { label:"OUTPUT - EXTERNAL", short:"Output - External", color:"#e76f51", y:0 },
+  Output:         { label:"OUTPUTS (NOT SPLIT)", short:"Outputs (not split)", color:"#f4a261", y:0 },
+  Unassigned:     { label:"UNKNOWN STAGE",      short:"Unknown stage",    color:"#7f8c8d", y:0 }
 };
+const ALWAYS = ["Input", "Calculation", "OutputInternal", "OutputExternal"];
+const BAND_STEP = 260;
+function fmtAmount(v) {
+  return v == null ? "-" : Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function flowMeta(f) {
+  const bits = [];
+  if (f.adjType) bits.push(f.adjType);
+  if (f.amount != null) bits.push(f.amountLabel + ": " + fmtAmount(f.amount));
+  return bits.join(" · ");
+}
 const ACTIONS = [["download","#3498db","Download"], ["upload","#9b59b6","Upload"], ["roll","#FBCE07","Rollforward"]];
 const OTHER_ACTION = "#dddddd";
 const COL_GAP = 250, BAND_H = 200, MIN_SCALE = 0.55, BAND_PAD = 190;
@@ -454,8 +582,8 @@ network.on("beforeDrawing", ctx => {
     ctx.strokeRect(left, top, width, BAND_H);
     ctx.fillStyle = L.color;
     ctx.font = "bold 20px Segoe UI, Arial";
-    ctx.textAlign = "left";
-    ctx.fillText(L.label + "  ·  " + (counts[k] || 0), left + 16, top + 28);
+    ctx.textAlign = "right";   // right side, so step arrows never cross the title
+    ctx.fillText(L.label + "  ·  " + (counts[k] || 0), left + width - 16, top + 28);
   });
 });
 
@@ -471,7 +599,8 @@ function makeNode(s) {
              highlight: { background: fill, border: "#ffffff" },
              hover: { background: fill, border: "#ffffff" } },
     font: { color: "#111111", size: 14, face: "Segoe UI, Arial" },
-    title: (s.location || "(no location)") + "\nAction: " + (s.action || "-")
+    title: (s.location || "(no work paper)") + (s.wpSheet ? " › " + s.wpSheet : "") +
+           "\nType: " + (s.action || "-") + (s.source ? "\nSource: " + s.source : "")
   };
 }
 
@@ -489,6 +618,20 @@ function makeEdges(f) {
     title: "Next step in order",
     smooth: { type: "curvedCCW", roundness: 0.1 }
   }));
+  // step-by-step view: every step -> the next one, one colour
+  f.steps.slice(1).forEach((s, i) => {
+    const prev = f.steps[i], sameBand = prev.bucket === s.bucket;
+    list.push({
+      id: "S" + i, from: prev.id, to: s.id, kind: "step", width: 2.5, hidden: true,
+      color: { color: "#f5f5f5", highlight: "#ffffff", hover: "#ffffff" },
+      arrows: { to: { enabled: true, type: "arrow", scaleFactor: 0.9 } },
+      arrowStrikethrough: false,
+      shadow: { enabled: true, color: "rgba(255,255,255,0.35)", size: 8, x: 0, y: 0 },
+      title: "Step " + (prev.step || "?") + " → Step " + (s.step || "?"),
+      // straight within a band; a smooth S-curve when dropping to the next band
+      smooth: sameBand ? false : { type: "cubicBezier", forceDirection: "vertical", roundness: 0.55 }
+    });
+  });
   return list;
 }
 
@@ -518,7 +661,8 @@ function loadFlow(i) {
   byId = {}; counts = {};
   flow.steps.forEach((s, k) => { byId[s.id] = s; s.order = k; counts[s.bucket] = (counts[s.bucket] || 0) + 1; });
   issueIds = new Set(flow.issues.filter(x => x.id).map(x => x.id));
-  lanesUsed = Object.keys(STAGE).filter(k => k !== "Unassigned" || counts.Unassigned);
+  lanesUsed = Object.keys(STAGE).filter(k => ALWAYS.includes(k) || counts[k]);
+  lanesUsed.forEach((k, n) => { STAGE[k].y = n * BAND_STEP; });
   // each band lays its steps left to right in step order, centred
   halfW = 0;
   lanesUsed.forEach(k => {
@@ -541,7 +685,8 @@ function loadFlow(i) {
   document.getElementById("search").value = "";
   document.getElementById("flowSelect").value = String(i);
   document.getElementById("flowPos").textContent = D.flows.length > 1 ? (i + 1) + " of " + D.flows.length : "";
-  document.getElementById("source").textContent = flow.file + " › " + flow.sheet + " · header row " + flow.headerRow;
+  document.getElementById("source").textContent = (flowMeta(flow) ? flowMeta(flow) + "  |  " : "") +
+    flow.file + " › " + flow.sheet + " · from row " + flow.headerRow;
   document.title = flow.name + " - Adjustment Flow";
   renderKpis();
   showOverview();
@@ -578,6 +723,12 @@ function dimExcept(keepN, keepE) {
 }
 
 function highlightLineage(id) {
+  if (stepMode()) {
+    const keepE = edges.get({ filter: e => e.kind === "step" && (e.from === id || e.to === id) });
+    const keepN = new Set([id]);
+    keepE.forEach(e => { keepN.add(e.from); keepN.add(e.to); });
+    return dimExcept(keepN, new Set(keepE.map(e => e.id)));
+  }
   const up = walk(id, "up"), down = walk(id, "down");
   dimExcept(new Set([id, ...up.nodes, ...down.nodes]), new Set([...up.edges, ...down.edges]));
 }
@@ -628,7 +779,9 @@ function itemHtml(s, sub) {
   return '<div class="item" data-id="' + s.id + '">' + stepLabel(s) +
          (sub ? '<br><small>' + esc(sub) + '</small>' : '') + '</div>';
 }
-function stepSub(s) { return (s.action || "-") + " · " + (s.location || "no location"); }
+function stepSub(s) {
+  return (s.action || "-") + " · " + (s.location || s.source || "no work paper") + (s.wpSheet ? " › " + s.wpSheet : "");
+}
 
 function bucketList(k) {
   const list = flow.steps.filter(s => s.bucket === k);
@@ -639,6 +792,7 @@ function bucketList(k) {
 function showOverview() {
   setActiveKpi("all");
   sidebar.innerHTML = "<h3>" + esc(flow.name) + "</h3>" +
+    (flowMeta(flow) ? '<div style="font-size:13px;margin:-2px 0 8px;color:#FBCE07">' + esc(flowMeta(flow)) + "</div>" : "") +
     '<p class="muted">Click any step, here or in the flow, to see its details. ' +
     "Click a card at the top to focus on it.</p>" +
     lanesUsed.map(bucketList).join("");
@@ -676,9 +830,7 @@ function showIssues() {
 function showDetail(id) {
   setActiveKpi(null);
   const s = byId[id];
-  const rows = [["Stage", s.stage], ["Step No.", s.step], ["Report/Schedule", s.report],
-                ["System/Location", s.location], ["Action", s.action], ["I/O", s.io],
-                ["Standard", s.standard], ...s.extras, ["Excel row", s.row]];
+  const rows = [...s.fields, ["Excel row", s.row]];
   let h = BACK + "<h3 style=\"margin-top:12px\">" + stepLabel(s) + '</h3><table class="kv">' + rows.map(([k, v]) =>
     "<tr><td>" + esc(k) + "</td><td>" +
     (v === "" || v == null ? '<span class="muted">-</span>' : esc(v).replace(/\n/g, "<br>")) +
@@ -728,10 +880,23 @@ sidebar.addEventListener("click", ev => {
   if (el && byId[el.dataset.id]) selectStep(el.dataset.id, true);
 });
 
+function stepMode() { return document.getElementById("tStep").checked; }
+
 function applyToggles() {
-  const f = document.getElementById("tFile").checked, q = document.getElementById("tSeq").checked;
-  edges.update(edges.get().map(e => ({ id: e.id, hidden: e.kind === "file" ? !f : !q })));
+  const f = document.getElementById("tFile").checked, q = document.getElementById("tSeq").checked, st = stepMode();
+  edges.update(edges.get().map(e => ({ id: e.id,
+    hidden: e.kind === "step" ? !st : e.kind === "file" ? (st || !f) : (st || !q) })));
 }
+// "Step-by-step only" swaps the detailed arrows for a single 1 -> 2 -> 3 ... chain
+document.getElementById("tStep").addEventListener("change", ev => {
+  document.getElementById("tFile").checked = !ev.target.checked;
+  document.getElementById("tSeq").checked = !ev.target.checked;
+  clearHighlight();
+  applyToggles();
+});
+["tFile", "tSeq"].forEach(id => document.getElementById(id).addEventListener("change", ev => {
+  if (ev.target.checked && stepMode()) { document.getElementById("tStep").checked = false; clearHighlight(); }
+}));
 document.getElementById("tFile").addEventListener("change", applyToggles);
 document.getElementById("tSeq").addEventListener("change", applyToggles);
 document.getElementById("resetBtn").addEventListener("click", () => { clearHighlight(); showOverview(); fitView(true); });
@@ -740,7 +905,7 @@ document.getElementById("search").addEventListener("keydown", ev => {
   if (ev.key !== "Enter") return;
   const q = ev.target.value.trim().toLowerCase();
   if (!q) return;
-  const hits = flow.steps.filter(s => [s.step, s.report, s.location, s.action, s.standard]
+  const hits = flow.steps.filter(s => [s.step, s.report, s.location, s.wpSheet, s.action, s.source, s.standard]
     .join(" ").toLowerCase().includes(q));
   if (!hits.length) { ev.target.style.borderColor = "#e74c3c"; return; }
   ev.target.style.borderColor = "#444";
@@ -752,7 +917,8 @@ document.getElementById("search").addEventListener("keydown", ev => {
 // flow picker
 const sel = document.getElementById("flowSelect");
 sel.innerHTML = D.flows.map((f, i) =>
-  '<option value="' + i + '">' + esc(f.name) + " — " + f.steps.length + " steps" +
+  '<option value="' + i + '">' + esc(f.name) + (f.adjType ? " (" + esc(f.adjType) + ")" : "") +
+  " — " + f.steps.length + " steps" +
   (f.issues.length ? " · ⚠ " + f.issues.length : "") + "</option>").join("");
 sel.addEventListener("change", () => loadFlow(parseInt(sel.value, 10)));
 document.getElementById("prevFlow").addEventListener("click", () =>
@@ -762,11 +928,12 @@ document.getElementById("nextFlow").addEventListener("click", () =>
 if (D.flows.length < 2) document.getElementById("flowPicker").style.display = "none";
 
 // legend
-document.getElementById("legend").innerHTML = "Border:" +
+document.getElementById("legend").innerHTML = "Border (Type):" +
   ACTIONS.map(([, c, n]) => '<span class="swb" style="border-color:' + c + '"></span>' + n).join("") +
   '<span class="swb" style="border-color:' + OTHER_ACTION + '"></span>Other &nbsp;|&nbsp; Arrows:' +
   '<span class="ln" style="border-top:2px solid #FBCE07"></span>Same file' +
-  '<span class="ln" style="border-top:2px dashed #888"></span>Step order';
+  '<span class="ln" style="border-top:2px dashed #888"></span>Step order' +
+  '<span class="ln" style="border-top:3px solid #fff"></span>Step by step';
 
 window.addEventListener("resize", () => network.redraw());
 
@@ -779,10 +946,41 @@ loadFlow(m && +m[1] < D.flows.length ? +m[1] : 0);
 """
 
 
-def build_html(flows_payload):
+def build_payload(flows):
+    """Turn found adjustments into the data the page draws (steps, arrows, issues)."""
+    payload = []
+    for idx, f in enumerate(flows):
+        a = f["adjustment"]
+        steps = adjustment_to_steps(a, f"F{idx}-")
+        data_edges, seq_edges = build_edges(steps)
+        first_row = a["details_row"] or min(t["header_row"] for t in a["tables"])
+        payload.append({
+            "name": f["name"], "file": f["file"], "sheet": a["sheet"],
+            "headerRow": first_row, "steps": steps,
+            "dataEdges": data_edges, "seqEdges": seq_edges, "issues": find_issues(steps),
+            "adjType": a["details"].get("adjType", ""),
+            "amountLabel": a["details"].get("amountLabel", "") or "Return (CY)",
+            "amount": a["details"].get("amount"),
+        })
+    return payload
+
+
+EMBED_CSS = """<style>
+  /* embedded in another app: that app shows the title, picker and cards */
+  .titlerow, #kpis { display:none !important; }
+  #topbar { padding-top:8px; }
+  .toolbar { margin-top:0; }
+  #sidebar { width:330px; }
+</style>"""
+
+
+def build_html(flows_payload, embedded=False):
     data_json = json.dumps({"flows": flows_payload}).replace("</", "<\\/")
     vis_js = get_vis_js().replace("</script", "<\\/script")
-    return HTML_TEMPLATE.replace("__DATA__", data_json).replace("__VISJS__", vis_js)
+    html = HTML_TEMPLATE.replace("__DATA__", data_json).replace("__VISJS__", vis_js)
+    if embedded:
+        html = html.replace("</head>", EMBED_CSS + "</head>", 1)
+    return html
 
 
 # ---------------------------------------------------------------- main
@@ -802,29 +1000,26 @@ def main():
 
     flows = load_flows(paths, args.sheet)
     if not flows:
-        print("No tables found. Each table needs a header row with at least "
-              "Stage, Step No., Report/Schedule and System/Location.")
+        print("No adjustments found. Each table needs a header row with at least "
+              "Sequence and two other known columns.")
         sys.exit(1)
 
-    payload = []
-    total_issues = 0
-    for idx, f in enumerate(flows):
-        t = f["table"]
-        steps = table_to_steps(t, f"F{idx}-")
-        data_edges, seq_edges = build_edges(steps)
-        issues = find_issues(steps)
-        total_issues += len(issues)
-        payload.append({
-            "name": f["name"], "file": f["file"], "sheet": t["sheet"],
-            "headerRow": t["header_row"], "steps": steps,
-            "dataEdges": data_edges, "seqEdges": seq_edges, "issues": issues,
-        })
+    payload = build_payload(flows)
+    total_issues = sum(len(p["issues"]) for p in payload)
+    for idx, (f, p) in enumerate(zip(flows, payload)):
+        steps, issues = p["steps"], p["issues"]
+        data_edges, seq_edges = p["dataEdges"], p["seqEdges"]
 
         counts = {}
         for s in steps:
             counts[s["bucket"]] = counts.get(s["bucket"], 0) + 1
-        print(f"\n[{idx + 1}] {f['name']}   ({f['file']} > '{t['sheet']}', header row {t['header_row']})")
-        print(f"    {len(steps)} step(s): " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        print(f"\n[{idx + 1}] {f['name']}   ({f['file']} > '{p['sheet']}', from row {p['headerRow']})")
+        if p["adjType"] or p["amount"] is not None:
+            amt = f"{p['amount']:,.2f}" if p["amount"] is not None else "-"
+            print(f"    {p['adjType'] or 'Type ?'} · {p['amountLabel']}: {amt}")
+        nice = {"Calculation": "Process", "OutputInternal": "Output - Internal",
+                "OutputExternal": "Output - External", "Output": "Output (not split)"}
+        print(f"    {len(steps)} step(s): " + ", ".join(f"{v} {nice.get(k, k)}" for k, v in counts.items()))
         print(f"    {len(data_edges)} file-match link(s), {len(seq_edges)} step-order link(s)")
         for i in issues:
             who = next((f"Step {s['step'] or '?'} (row {s['row']})"
