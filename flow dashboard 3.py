@@ -195,7 +195,7 @@ def txt(v):
 
 # ---------------------------------------------------------------- static flow (light)
 # layout of the static flow (pixels)
-CARD_W, CARD_H, GAP_X, ROW_GAP, BAND_GAP = 200, 104, 48, 34, 46
+CARD_W, CARD_H, GAP_X, ROW_GAP, BAND_GAP = 200, 116, 48, 34, 46
 PER_ROW, PAD_X, BAND_TOP, BAND_BOTTOM = 4, 24, 42, 18
 FLOW_W = 2 * PAD_X + PER_ROW * CARD_W + (PER_ROW - 1) * GAP_X
 FONT = "Source Sans Pro, Segoe UI, Arial, sans-serif"
@@ -291,14 +291,17 @@ def static_flow_svg(flow, uid="ah", marks=None):
         wp = s["location"] or s["source"] or "no work paper"
         if s["location"] and s["wpSheet"]:
             wp += " › " + s["wpSheet"]
-        out.append(f'<text x="{x + 12}" y="{y0 + 82}" font-size="11" fill="#6b7280">'
+        out.append(f'<text x="{x + 12}" y="{y0 + 74}" font-size="11" fill="#6b7280">'
                    f'📄 {esc(clip(wp, 30))}</text>')
+        if s["standard"]:
+            out.append(f'<text x="{x + 12}" y="{y0 + 90}" font-size="11" fill="#374151">'
+                       f'Basis: {esc(clip(s["standard"], 30))}</text>')
         warn = issue_count.get(s["id"])
         if warn:
-            out.append(f'<text x="{x + 12}" y="{y0 + 97}" font-size="10.5" font-weight="700" '
+            out.append(f'<text x="{x + 12}" y="{y0 + 106}" font-size="10.5" font-weight="700" '
                        f'fill="#c0392b">⚠ {warn} issue{"s" if warn > 1 else ""}</text>')
         if shared:
-            out.append(f'<text x="{x + CARD_W - 12}" y="{y0 + 97}" font-size="10.5" font-weight="700" '
+            out.append(f'<text x="{x + CARD_W - 12}" y="{y0 + 106}" font-size="10.5" font-weight="700" '
                        f'fill="#7b3fa8" text-anchor="end">⇄ shared × {len(marks[s["id"]])}</text>')
         out.append('</g>')
     out.append('</svg>')
@@ -397,8 +400,9 @@ def overlap_html(fi, flows, index, uid="ov"):
 
 # ---------------------------------------------------------------- overall flow (all adjustments)
 ADJ_COLOURS = ["#2a9d8f", "#e76f51", "#7b3fa8", "#1f6fb2", "#c0392b", "#b7791f", "#2e7d32", "#0e7490"]
-MAP_LANE_W, MAP_LANE_GAP, MAP_MARGIN = 236, 26, 20          # one process lane per adjustment
-MAP_LANE_HEAD, MAP_STEP_H, MAP_STEP_GAP = 50, 60, 16
+MAP_MAX_W = 1040                                              # widest the picture gets
+MAP_LANE_W, MAP_LANE_GAP, MAP_MARGIN, MAP_LANE_ROW_GAP = 230, 22, 20, 18
+MAP_LANE_HEAD, MAP_STEP_H, MAP_STEP_GAP = 50, 76, 14
 MAP_STEP_W = MAP_LANE_W - 28
 MAP_CARD_W, MAP_CARD_H, MAP_GAP, MAP_ROW_GAP = 200, 60, 22, 16   # input and output cards
 MAP_LABEL_H, MAP_BAND_GAP, MAP_PAD = 34, 70, 14
@@ -406,10 +410,12 @@ MAP_MAIN = ["Input", "Calculation", "OutputInternal", "OutputExternal"]
 MAP_LABEL = {"Input": "Inputs", "Calculation": "Process - one lane per adjustment",
              "OutputInternal": "Output - Internal", "OutputExternal": "Output - External",
              "Output": "Outputs (not split)", "Unassigned": "Unknown stage"}
-MAP_CSS = ("<style>.cons-sum{font-size:15px;margin:0 0 4px;color:#374151;"
-           "font-family:Source Sans Pro,Segoe UI,Arial,sans-serif}"
-           ".cons-legend{font-size:13px;color:#6b7280;margin:0 0 10px;"
-           "font-family:Source Sans Pro,Segoe UI,Arial,sans-serif}</style>")
+MAP_CSS = ("<style>"
+           ".cons-sum{font-size:15px;margin:0 0 4px;color:#374151;font-family:Source Sans Pro,Segoe UI,Arial,sans-serif}"
+           ".cons-legend{font-size:13px;color:#6b7280;margin:0 0 10px;font-family:Source Sans Pro,Segoe UI,Arial,sans-serif}"
+           "svg.fm .fm-l,svg.fm .fm-n,svg.fm .fm-a{transition:opacity .15s}"
+           "svg.fm .fm-l{opacity:.7}"
+           "</style>")
 
 
 def consolidated_items(flows):
@@ -436,30 +442,42 @@ def consolidated_items(flows):
 
 
 def overall_flow_html(flows):
-    """Every adjustment on one picture. Inputs on top (one card per work paper, shared ones
-    once), then one process lane per adjustment, then internal and external outputs.
-    Coloured lines: input -> the adjustments that use it; adjustment lane -> the outputs it
-    produces. Returns (html, height in pixels)."""
+    """Every adjustment on one picture. Inputs on top (one card per work paper, shared ones once),
+    then one process lane per adjustment (lanes wrap into rows of up to four), then internal and
+    external outputs. Coloured lines join inputs to the adjustments that use them and adjustments
+    to the outputs they produce. Hover a lane or card to show only its connections.
+    Returns (html, height in pixels)."""
     groups = consolidated_items(flows)
     n = len(flows)
     uid = "fm"
-    width = 2 * MAP_MARGIN + n * MAP_LANE_W + max(0, n - 1) * MAP_LANE_GAP
+    lanes_per_row = max(1, min(n, (MAP_MAX_W - 2 * MAP_MARGIN + MAP_LANE_GAP)
+                               // (MAP_LANE_W + MAP_LANE_GAP)))
+    lane_row_w = lanes_per_row * MAP_LANE_W + (lanes_per_row - 1) * MAP_LANE_GAP
+    width = max(520, min(MAP_MAX_W, 2 * MAP_MARGIN + lane_row_w))
     per_row = max(1, (width - 2 * MAP_MARGIN + MAP_GAP) // (MAP_CARD_W + MAP_GAP))
     stages = MAP_MAIN + [b for b in ("Output", "Unassigned")
                          if any(g["stage"] == b for g in groups.values())]
-    lane_x = [MAP_MARGIN + i * (MAP_LANE_W + MAP_LANE_GAP) for i in range(n)]
 
     # ---- layout
-    bands, card_pos, lane_geo = [], {}, {}
+    bands, card_pos, lane_geo, card_idx = [], {}, {}, {}
     y = 0
     for b in stages:
         top = y
         if b == "Calculation":
-            for fi, f in enumerate(flows):
-                m = max(1, sum(1 for s in f["steps"] if s["bucket"] == b))
-                h = MAP_LANE_HEAD + 6 + m * MAP_STEP_H + (m - 1) * MAP_STEP_GAP + MAP_PAD
-                lane_geo[fi] = (lane_x[fi], top + MAP_LABEL_H, h)
-            inner = max([h for _, _, h in lane_geo.values()] or [MAP_LANE_HEAD + MAP_STEP_H + MAP_PAD])
+            row_top = top + MAP_LABEL_H
+            for start in range(0, n, lanes_per_row):
+                members = list(range(start, min(n, start + lanes_per_row)))
+                row_w = len(members) * MAP_LANE_W + (len(members) - 1) * MAP_LANE_GAP
+                x_off = (width - row_w) / 2
+                row_h = 0
+                for c, fi in enumerate(members):
+                    m = max(1, sum(1 for s in flows[fi]["steps"] if s["bucket"] == b))
+                    row_h = max(row_h, MAP_LANE_HEAD + 6 + m * MAP_STEP_H + (m - 1) * MAP_STEP_GAP + MAP_PAD)
+                    lane_geo[fi] = [x_off + c * (MAP_LANE_W + MAP_LANE_GAP), row_top, 0]
+                for fi in members:
+                    lane_geo[fi][2] = row_h
+                row_top += row_h + MAP_LANE_ROW_GAP
+            inner = (row_top - MAP_LANE_ROW_GAP - (top + MAP_LABEL_H)) if n else 24
             count = sum(1 for f in flows for s in f["steps"] if s["bucket"] == b)
         else:
             items = sorted(((k, g) for k, g in groups.items() if k[0] == b),
@@ -471,18 +489,30 @@ def overall_flow_html(flows):
                 row_w = in_row * MAP_CARD_W + (in_row - 1) * MAP_GAP
                 x0 = (width - row_w) / 2 + c * (MAP_CARD_W + MAP_GAP)
                 card_pos[k] = (x0, top + MAP_LABEL_H + r * (MAP_CARD_H + MAP_ROW_GAP))
+                card_idx[k] = len(card_idx)
             inner = rows * MAP_CARD_H + (rows - 1) * MAP_ROW_GAP if items else 24
             count = len(items)
-        height = MAP_LABEL_H + inner + MAP_PAD
-        bands.append((b, top, height, count))
-        y = top + height + MAP_BAND_GAP
+        bands.append((b, top, MAP_LABEL_H + inner + MAP_PAD, count))
+        y = top + MAP_LABEL_H + inner + MAP_PAD + MAP_BAND_GAP
     total_h = y - MAP_BAND_GAP + 6
 
     def col(fi):
         return ADJ_COLOURS[fi % len(ADJ_COLOURS)]
 
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {total_h}" width="100%" '
-           f'style="max-width:{width}px;display:block;font-family:{FONT}"><defs>']
+    # ---- hover focus rules: hovering a lane or card dims everything not connected to it
+    focus = []
+    for fi in range(n):
+        focus.append(f"svg.fm:has(.fm-a{fi}:hover) .fm-l:not(.fm-l{fi}),"
+                     f"svg.fm:has(.fm-a{fi}:hover) .fm-n:not(.fm-c{fi}),"
+                     f"svg.fm:has(.fm-a{fi}:hover) .fm-a:not(.fm-a{fi}){{opacity:.12}}")
+    for k, i in card_idx.items():
+        g = groups[k]
+        cls = f"fm-k{i}"
+        focus.append(f"svg.fm:has(.{cls}:hover) .fm-l:not(.{cls}),"
+                     f"svg.fm:has(.{cls}:hover) .fm-n:not(.{cls}){{opacity:.12}}")
+    out = [f'<svg class="fm" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {total_h}" '
+           f'width="100%" style="max-width:{width}px;display:block;font-family:{FONT}">',
+           "<defs>"]
     for fi in range(n):
         out.append(f'<marker id="{uid}c{fi}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
                    f'markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" '
@@ -490,26 +520,27 @@ def overall_flow_html(flows):
     out.append(f'<marker id="{uid}k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" '
                f'markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" '
                f'fill="#4b5563"/></marker></defs>')
+    out.append("<style>" + "".join(focus) + "</style>")
 
     # ---- bands
     for b, top, h, count in bands:
         tint, accent = BAND_STYLE.get(b, ("#f3f4f6", "#9ca3af"))
         out.append(f'<rect x="2" y="{top}" width="{width - 4}" height="{h}" rx="12" fill="{tint}"/>')
         out.append(f'<rect x="2" y="{top}" width="6" height="{h}" rx="3" fill="{accent}"/>')
-        label = MAP_LABEL.get(b, b)
         sub = "" if b == "Calculation" else f'  ·  {count} item{"s" if count != 1 else ""}'
         out.append(f'<text x="{MAP_MARGIN}" y="{top + 23}" font-size="13" font-weight="700" '
-                   f'fill="#374151" letter-spacing="0.6">{esc(label.upper())}'
+                   f'fill="#374151" letter-spacing="0.6">{esc(MAP_LABEL.get(b, b).upper())}'
                    f'<tspan font-weight="400" fill="#6b7280" letter-spacing="0">{esc(sub)}</tspan></text>')
         if b != "Calculation" and count == 0:
             out.append(f'<text x="{width / 2}" y="{top + MAP_LABEL_H + 16}" font-size="12" '
                        f'fill="#6b7280" text-anchor="middle">none in this stage</text>')
 
-    # ---- connecting lines (drawn under the cards and lanes)
+    # ---- connecting lines (under the cards and lanes)
     for (stage, key), g in groups.items():
         if (stage, key) not in card_pos:
             continue
         x, y0 = card_pos[(stage, key)]
+        ci = card_idx[(stage, key)]
         for fi in sorted(g["adjs"]):
             lx, lt, lh = lane_geo[fi]
             lcx = lx + MAP_LANE_W / 2
@@ -518,13 +549,15 @@ def overall_flow_html(flows):
             else:
                 x1, y1, x2, y2 = lcx, lt + lh, x + MAP_CARD_W / 2, y0
             my = (y1 + y2) / 2
-            out.append(f'<path d="M{x1},{y1} C{x1},{my} {x2},{my} {x2},{y2}" fill="none" '
-                       f'stroke="{col(fi)}" stroke-width="1.8" opacity="0.85" '
+            out.append(f'<path class="fm-l fm-l{fi} fm-k{ci}" d="M{x1},{y1} C{x1},{my} {x2},{my} {x2},{y2}" '
+                       f'fill="none" stroke="{col(fi)}" stroke-width="1.8" '
                        f'marker-end="url(#{uid}c{fi})"/>')
 
     # ---- process lanes, one per adjustment
     for fi, f in enumerate(flows):
         lx, lt, lh = lane_geo[fi]
+        steps = [s for s in f["steps"] if s["bucket"] == "Calculation"]
+        out.append(f'<g class="fm-a fm-a{fi}">')
         out.append(f'<rect x="{lx}" y="{lt}" width="{MAP_LANE_W}" height="{lh}" rx="12" '
                    f'fill="#ffffff" stroke="{col(fi)}" stroke-width="1.5"/>')
         out.append(f'<rect x="{lx}" y="{lt}" width="{MAP_LANE_W}" height="{MAP_LANE_HEAD}" rx="12" '
@@ -533,7 +566,6 @@ def overall_flow_html(flows):
                    f'{esc(clip(f["name"], 26))}</text>')
         out.append(f'<text x="{lx + 12}" y="{lt + 38}" font-size="11" fill="#fff" opacity="0.9">'
                    f'{esc((f["adjType"] or "Adjustment") + " adjustment")}</text>')
-        steps = [s for s in f["steps"] if s["bucket"] == "Calculation"]
         if not steps:
             out.append(f'<text x="{lx + MAP_LANE_W / 2}" y="{lt + MAP_LANE_HEAD + 30}" font-size="12" '
                        f'fill="#6b7280" text-anchor="middle">no process steps</text>')
@@ -551,44 +583,52 @@ def overall_flow_html(flows):
                        f'{esc(clip(s["report"] or "(no name)", 26))}</text>')
             out.append(f'<text x="{sx + 10}" y="{sy + 51}" font-size="10.5" fill="#6b7280">'
                        f'📄 {esc(clip(wp, 28))}</text>')
+            if s["standard"]:
+                out.append(f'<text x="{sx + 10}" y="{sy + 66}" font-size="10.5" fill="#374151">'
+                           f'Basis: {esc(clip(s["standard"], 26))}</text>')
             if k < len(steps) - 1:
                 cx = lx + MAP_LANE_W / 2
                 out.append(f'<line x1="{cx}" y1="{sy + MAP_STEP_H}" x2="{cx}" '
                            f'y2="{sy + MAP_STEP_H + MAP_STEP_GAP}" stroke="#4b5563" '
                            f'stroke-width="1.6" marker-end="url(#{uid}k)"/>')
+        out.append("</g>")
 
     # ---- input and output cards
     for (stage, key), g in groups.items():
         if (stage, key) not in card_pos:
             continue
         x, y0 = card_pos[(stage, key)]
+        ci = card_idx[(stage, key)]
         shared = len(g["adjs"]) > 1
         edge = "#7b3fa8" if shared else "#e5e7eb"
         dash = ' stroke-dasharray="6 4"' if shared else ""
-        sub = f"› {g['sheet']}" if g["sheet"] else clip("; ".join(g["reports"]), 30)
+        sub = f"› {g['sheet']}" if g["sheet"] else "; ".join(g["reports"])
+        classes = " ".join(["fm-n", f"fm-k{ci}"] + [f"fm-c{fi}" for fi in sorted(g["adjs"])])
+        out.append(f'<g class="{classes}">')
         out.append(f'<rect x="{x}" y="{y0}" width="{MAP_CARD_W}" height="{MAP_CARD_H}" rx="10" '
                    f'fill="#ffffff" stroke="{edge}" stroke-width="{2 if shared else 1}"{dash}/>')
         out.append(f'<text x="{x + 12}" y="{y0 + 22}" font-size="13.5" font-weight="600" fill="#111827">'
                    f'{esc(clip(g["title"], 28))}</text>')
-        out.append(f'<text x="{x + 12}" y="{y0 + 39}" font-size="11" fill="#6b7280">{esc(clip(sub, 30))}</text>')
-        label = (f"⇄ shared by {len(g['adjs'])}" if shared else "used by 1")
+        out.append(f'<text x="{x + 12}" y="{y0 + 39}" font-size="11" fill="#6b7280">'
+                   f'{esc(clip(sub, 30))}</text>')
+        label = f"⇄ shared by {len(g['adjs'])}" if shared else "used by 1"
         out.append(f'<text x="{x + 12}" y="{y0 + MAP_CARD_H - 10}" font-size="10.5" font-weight="700" '
                    f'fill="{"#7b3fa8" if shared else "#6b7280"}">{esc(label)}</text>')
         for j, fi in enumerate(sorted(g["adjs"])):
             cx = x + MAP_CARD_W - 12 - j * 14
             out.append(f'<circle cx="{cx}" cy="{y0 + MAP_CARD_H - 14}" r="5" fill="{col(fi)}">'
                        f'<title>{esc(flows[fi]["name"])}</title></circle>')
+        out.append("</g>")
     out.append("</svg>")
 
     def cnt(stage):
         items = [g for (s_, _), g in groups.items() if s_ == stage]
-        shared_n = sum(1 for g in items if len(g["adjs"]) > 1)
-        return f"{len(items)} ({shared_n} shared)"
+        return f"{len(items)} ({sum(1 for g in items if len(g['adjs']) > 1)} shared)"
 
     summary = (f"{n} adjustment{'s' if n != 1 else ''}. Inputs: {cnt('Input')}. "
                f"Output - Internal: {cnt('OutputInternal')}. Output - External: {cnt('OutputExternal')}.")
-    legend = ("Each coloured line joins an input to an adjustment that uses it, or an adjustment to "
-              "an output it produces. Dashed purple = used by more than one adjustment.")
+    legend = ("Hover a lane or a card to see only its connections. Dashed purple = used by more "
+              "than one adjustment.")
     html = (MAP_CSS + f'<p class="cons-sum">{esc(summary)}</p>'
             + f'<p class="cons-legend">{esc(legend)}</p>' + "".join(out))
     return html, int(total_h) + 90
